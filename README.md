@@ -25,6 +25,8 @@ Lightweight Telegram bot that lets two people track shared travel expenses via D
 - `/settle 100 MAD payout note` — record a settlement payout from the caller to the other user (comment optional) and reset balances to zero. The settlement is stored in history.
 - Plain text like `12.40 coffee` also logs an expense.
 
+Note: This repo currently tracks small maintenance tweaks; feel free to remove this line after merging the YOLO test PR.
+
 ## Systemd service (server)
 1) Copy the repo to your server (e.g. `/usr/bots/travel-bot`) and create a `.env` there.  
 2) Create a venv and install deps on the server:
