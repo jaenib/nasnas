@@ -1,6 +1,6 @@
 # Travel Split Bot
 
-Lightweight Telegram bot that lets two people track shared travel expenses via DM. Every entry is split 50/50 and the bot replies with current standings.
+EasyP Telegram bot that lets two people track shared travel expenses via DM. Every entry is split 50/50 and the bot replies with current standings.
 
 ## Setup
 - Copy `.env.example` to `.env` and fill in `BOT_TOKEN`, both user IDs, and display names. Optional: `HEALTHCHECK_CHAT_ID` for a daily "alive" ping.
