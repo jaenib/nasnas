@@ -22,7 +22,7 @@ Lightweight Telegram bot that lets two people track shared travel expenses via D
 - `/add 42.5 EUR taxi` — log with explicit currency; converted to base using the configured rate.
 - `/balance` — show who owes whom.
 - `/history` — show the last 10 entries (expenses + settlements).
-- `/settle 100 MAD payout note` — record a settlement payout (comment optional) and reset balances to zero. The settlement is stored in history.
+- `/settle 100 MAD payout note` — record a settlement payout from the caller to the other user (comment optional) and reset balances to zero. The settlement is stored in history.
 - Plain text like `12.40 coffee` also logs an expense.
 
 ## Systemd service (server)

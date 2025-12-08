@@ -168,6 +168,7 @@ class Ledger:
     def record_settlement(
         self,
         payer_id: int,
+        receiver_id: int,
         amount: float,
         currency: str,
         comment: str,
@@ -178,6 +179,8 @@ class Ledger:
         settlement = {
             "payer_id": payer_id,
             "payer_name": self.users[payer_id].name,
+            "receiver_id": receiver_id,
+            "receiver_name": self.users[receiver_id].name,
             "amount": round(amount, 2),
             "currency": currency,
             "amount_base": round(amount_base, 2),
@@ -267,7 +270,7 @@ def parse_settlement_text(text: str) -> Tuple[float, Optional[str], str]:
     amount = float(amount_raw.replace(",", "."))
     if amount <= 0:
         raise ValueError("Amount must be positive.")
-    comment = (comment_raw or "").strip()
+    comment = (comment_raw or "").strip() or "settlement"
     return round(amount, 2), currency, comment
 
 
@@ -340,6 +343,7 @@ def format_entry_line(entry: dict, base_currency: str) -> str:
         except Exception:
             created_str = created or "unknown time"
         payer = entry.get("payer_name") or str(entry.get("payer_id"))
+        receiver = entry.get("receiver_name") or str(entry.get("receiver_id", ""))
         amount = float(entry.get("amount", 0))
         currency = entry.get("currency", base_currency)
         amount_base = entry.get("amount_base")
@@ -349,7 +353,7 @@ def format_entry_line(entry: dict, base_currency: str) -> str:
         comment = entry.get("comment", "")
         cleared = entry.get("cleared_expenses", 0)
         return (
-            f"{created_str}: Settlement by {payer} of {amount:.2f} {currency}{base_note}; "
+            f"{created_str}: Settlement {payer} paid {receiver} {amount:.2f} {currency}{base_note}; "
             f"cleared {cleared} expenses. Note: {comment or '—'}"
         )
     return format_expense_line(entry, base_currency)
@@ -419,11 +423,17 @@ async def currency_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
         await finalize_expense(query, context, actor, amount, currency, description)
     elif kind == "settlement":
-        if amount is None or comment is None:
+        receiver_id = pending.get("receiver_id")
+        if amount is None or comment is None or receiver_id is None:
             await query.edit_message_text("Incomplete pending settlement data.")
             context.user_data.pop("pending_currency", None)
             return
-        await finalize_settlement(query, context, actor, amount, currency, comment)
+        receiver = user_from_id(receiver_id, config)
+        if not receiver:
+            await query.edit_message_text("Receiver not found.")
+            context.user_data.pop("pending_currency", None)
+            return
+        await finalize_settlement(query, context, actor, receiver, amount, currency, comment)
     else:
         await query.edit_message_text("Unknown pending action.")
 
@@ -568,6 +578,13 @@ async def settle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not actor:
         await update.message.reply_text("You're not on the traveler list for this bot.")
         return
+
+    # Determine receiver (the other configured user)
+    receiver = next((u for u in config.users if u.id != actor.id), None)
+    if not receiver:
+        await update.message.reply_text("Need exactly two users configured for settlement.")
+        return
+
     text = " ".join(context.args) if context.args else (update.message.text or "")
     try:
         amount, currency, comment = parse_settlement_text(text)
@@ -581,6 +598,7 @@ async def settle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "amount": amount,
             "comment": comment,
             "payer_id": actor.id,
+            "receiver_id": receiver.id,
         }
         await update.message.reply_text(
             "Choose a currency for the settlement:",
@@ -588,13 +606,14 @@ async def settle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    await finalize_settlement(update, context, actor, amount, currency, comment)
+    await finalize_settlement(update, context, actor, receiver, amount, currency, comment)
 
 
 async def finalize_settlement(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     actor: UserConfig,
+    receiver: UserConfig,
     amount: float,
     currency: str,
     comment: str,
@@ -611,6 +630,7 @@ async def finalize_settlement(
         return
     ledger.record_settlement(
         payer_id=actor.id,
+        receiver_id=receiver.id,
         amount=amount,
         currency=currency,
         comment=comment,
@@ -619,7 +639,7 @@ async def finalize_settlement(
         balances_before=net_before,
     )
     reply = (
-        f"Recorded settlement: {amount:.2f} {currency} by {actor.name} "
+        f"Recorded settlement: {actor.name} paid {receiver.name} {amount:.2f} {currency} "
         f"('{comment}'). Expenses reset. Balances are now 0 for everyone."
     )
     if hasattr(update, "message") and update.message:
