@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+.venv/
+.idea/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+data/*.json.bak
+data/expenses.json

@@ -1,0 +1,12 @@
+[Unit]
+Description=Travel Split Telegram Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/usr/bots/travel-bot
+EnvironmentFile=/usr/bots/travel-bot/.env
+ExecStart=/usr/bots/travel-bot/.venv/bin/python /usr/bots/travel-bot/bot.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
