@@ -22,7 +22,7 @@ EasyP Telegram bot that lets two people track shared travel expenses via DM. Eve
 - `/add 42.5 EUR taxi` — log with explicit currency; converted to base using the configured rate.
 - `/balance` — show who owes whom.
 - `/history` — show the last 10 entries (expenses + settlements).
-- `/settle 100 MAD payout note` — record a settlement payout from the caller to the other user (comment optional) and reset balances to zero. The settlement is stored in history.
+- `/settle [comment]` — record who owed whom at current balances (base currency), mark it paid, and reset expenses to zero. The settlement is stored in history.
 - Plain text like `12.40 coffee` also logs an expense.
 
 Note: This repo currently tracks small maintenance tweaks; feel free to remove this line after merging the YOLO test PR.
