@@ -20,24 +20,41 @@ Lightweight Telegram bot for shared expenses, agreements, and challenges. The or
 ## Instances
 - Private chats use the legacy `default` instance configured by `USER_ONE_ID` and `USER_TWO_ID`.
 - Group chats automatically get their own instance keyed by the Telegram chat ID.
-- In a group, each participant subscribes with `/join`; `/leave` removes them from that group instance.
+- `/join` and `/leave` control **expense splitting** membership only. Agreements and challenges are open to everyone in a group chat — no subscription needed.
 - `/instance` shows the active instance and members.
-- `/instances` lists the instances you belong to; in a DM, `/use <instance_id>` switches your active instance.
+- `/instances` lists the instances you belong to; in a DM, `/use <instance_id>` switches your active instance. Inline buttons always act on the instance they were posted for, so accepting an agreement from a DM works even with another instance active.
+- Actions taken from a DM (agreement activated, challenge won/ended) are announced in the instance's group chat.
 
-## Commands
+## Expense commands
 - `/add 23.50 dinner` — log an expense paid by you, split evenly (if you omit currency, the bot asks with an inline picker).
 - `/add 42.5 EUR taxi` — log with explicit currency; converted to base using the configured rate.
 - `/balance` — show who owes whom.
 - `/history` — show the last 10 entries (expenses + settlements).
 - `/settle [comment]` — for two-member instances, record who owed whom at current balances (base currency), mark it paid, and reset expenses to zero.
-- `/agree <text>` — propose an agreement for all subscribed members.
-- `/accept [agreement_id]` — accept the latest pending agreement, or a specific one.
-- `/agreements` — list recent agreements.
-- `/challenge [target] <title>` — create a shared challenge, e.g. `/challenge 100 push-ups`.
-- `/score [challenge_id] <amount>` — add progress to the latest active challenge or a specific one.
-- `/challenges` — list recent challenge standings.
 - `/pushups <count>` — built-in daily push-up challenge log.
-- Plain text like `12.40 coffee` also logs an expense.
+- Plain text like `12.40 coffee` also logs an expense (DMs only).
+
+## Agreements 🤝
+An agreement binds the people who accept it, and takes effect once **two** people are in.
+- `/agree <text>` — propose an agreement. The proposal message carries ✅ Accept / ❌ Decline buttons; the proposer counts as accepted.
+- `/accept [id]` / `/decline [id]` — respond to the latest open agreement, or a specific one. Accepting an active agreement joins it; declining one you accepted leaves it (below two acceptors it goes back to pending).
+- `/revoke <id>` — creator withdraws the agreement for everyone.
+- `/breach [id] [name] [note]` — record a broken agreement. Reply to someone's message to blame them, name them (`/breach a2 Bob skipped again`), or omit the name to own up yourself. Strike counts show on the agreement.
+- `/agreements [all|active|pending]` — list agreements (default: open ones).
+
+## Challenges 🏆
+- `/challenge [target] <title> [for 7d | for 2w | until YYYY-MM-DD]` — start a challenge, e.g. `/challenge 100 push-ups for 7d`.
+- Every challenge message has `+1 / +5 / +10` buttons that update the leaderboard in place, plus 📊 Standings and 🏁 End (creator only).
+- `/score [id] <amount>` — log progress; negative amounts correct mistakes (totals never go below zero).
+- First to reach the target wins on the spot 🎉. Deadline challenges close automatically (checked daily at 00:05 UTC and on access) and the top scorer takes it.
+- Leaderboards show progress bars toward the target and 🔥 day-streaks.
+- `/challenges [all|done]` — list challenges (default: active).
+- `/endchallenge [id]` — creator closes a challenge early; top scorer wins.
+
+## Tests
+```bash
+python3 -m unittest discover -s tests -t .
+```
 
 ## Deployment
 - Pushes to `main` deploy automatically through GitHub Actions (`.github/workflows/deploy.yml`).
@@ -80,6 +97,6 @@ Lightweight Telegram bot for shared expenses, agreements, and challenges. The or
    ```
 
 ## Notes
-- Only the two configured user IDs can interact with the bot.
-- Amounts are always split 50/50; adjust code if you need custom splits.
+- Expense commands are limited to configured/joined members; agreements and challenges are open to anyone in a group chat.
+- Amounts are always split evenly between joined members; adjust code if you need custom splits.
 - The bot keeps an append-only JSON ledger; back it up if you care about history.

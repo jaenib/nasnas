@@ -1,12 +1,14 @@
 """
-Simple Telegram bot to track shared travel expenses between two people.
+Telegram bot for shared group life: expenses, agreements, and challenges.
 
-Usage (DM the bot):
-- `/add 23.50 lunch` to record an expense paid by you, split 50/50.
-- `/balance` to see who owes whom.
-- `/history` to see the last few entries.
-
-All expenses are split evenly between the two configured users.
+Each chat gets its own isolated instance (the legacy two-user DM setup is the
+`default` instance). Per instance:
+- Expenses: `/add 23.50 lunch`, `/balance`, `/history`, `/settle` — split
+  evenly between members who opted in with `/join`.
+- Agreements: `/agree <text>` proposes a pact; it activates once two people
+  accept (inline buttons or /accept, /decline). `/breach` tracks strikes.
+- Challenges: `/challenge 100 push-ups for 7d` with live leaderboards,
+  streaks, progress bars, winner detection, and deadline sweeps.
 """
 
 from __future__ import annotations
@@ -303,6 +305,9 @@ class Ledger:
             "creator_id": creator.id,
             "creator_name": creator.name,
             "accepted_by": [creator.id],
+            "declined_by": [],
+            "breaches": [],
+            "participants": {str(creator.id): creator.name},
             "status": "pending",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -311,49 +316,122 @@ class Ledger:
         self._save()
         return agreement
 
-    def accept_agreement(self, agreement_id: str, user: UserConfig) -> dict:
+    def respond_agreement(self, agreement_id: str, user: UserConfig, accept: bool) -> dict:
         agreement = self.find_agreement(agreement_id)
         if not agreement:
             raise ValueError(f"Agreement {agreement_id} was not found.")
-        if agreement.get("status") == "cancelled":
-            raise ValueError(f"Agreement {agreement_id} is cancelled.")
+        if agreement.get("status") in ("revoked", "cancelled"):
+            raise ValueError(f"Agreement {agreement_id} was revoked.")
         accepted = agreement.setdefault("accepted_by", [])
-        if user.id not in accepted:
-            accepted.append(user.id)
+        declined = agreement.setdefault("declined_by", [])
+        agreement.setdefault("participants", {})[str(user.id)] = user.name
+        if accept:
+            if user.id in declined:
+                declined.remove(user.id)
+            if user.id not in accepted:
+                accepted.append(user.id)
+        else:
+            if user.id in accepted:
+                accepted.remove(user.id)
+            if user.id not in declined:
+                declined.append(user.id)
         self._update_agreement_status(agreement)
         self._save()
         return agreement
 
-    def latest_pending_agreement(self) -> Optional[dict]:
+    def revoke_agreement(self, agreement_id: str, user: UserConfig) -> dict:
+        agreement = self.find_agreement(agreement_id)
+        if not agreement:
+            raise ValueError(f"Agreement {agreement_id} was not found.")
+        if agreement.get("status") in ("revoked", "cancelled"):
+            raise ValueError(f"Agreement {agreement_id} is already revoked.")
+        if int(agreement.get("creator_id", 0)) != user.id:
+            raise ValueError("Only the creator can revoke an agreement.")
+        agreement["status"] = "revoked"
+        agreement["revoked_at"] = datetime.now(timezone.utc).isoformat()
+        self._save()
+        return agreement
+
+    def record_breach(
+        self, agreement_id: str, offender: UserConfig, reporter: UserConfig, note: str
+    ) -> dict:
+        agreement = self.find_agreement(agreement_id)
+        if not agreement:
+            raise ValueError(f"Agreement {agreement_id} was not found.")
+        if agreement.get("status") != "active":
+            raise ValueError("Breaches can only be recorded against active agreements.")
+        participants = agreement.setdefault("participants", {})
+        participants.setdefault(str(offender.id), offender.name)
+        participants.setdefault(str(reporter.id), reporter.name)
+        agreement.setdefault("breaches", []).append(
+            {
+                "user_id": offender.id,
+                "user_name": offender.name,
+                "reported_by": reporter.id,
+                "reporter_name": reporter.name,
+                "note": note.strip(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        self._save()
+        return agreement
+
+    def latest_open_agreement(self) -> Optional[dict]:
         for agreement in reversed(self.state.get("agreements", [])):
             if agreement.get("status") == "pending":
+                return agreement
+        for agreement in reversed(self.state.get("agreements", [])):
+            if agreement.get("status") == "active":
+                return agreement
+        return None
+
+    def latest_active_agreement(self) -> Optional[dict]:
+        for agreement in reversed(self.state.get("agreements", [])):
+            if agreement.get("status") == "active":
                 return agreement
         return None
 
     def find_agreement(self, agreement_id: str) -> Optional[dict]:
-        wanted = agreement_id.strip().lower()
+        wanted = str(agreement_id or "").strip().lower()
+        if not wanted:
+            return None
         for agreement in self.state.get("agreements", []):
             if str(agreement.get("id", "")).lower() == wanted:
                 return agreement
         return None
 
     def _update_agreement_status(self, agreement: dict) -> None:
-        participant_ids = set(self.users)
+        # An agreement binds its acceptors; it takes effect once at least two
+        # people are in. Revoked agreements never change status again.
+        if agreement.get("status") in ("revoked", "cancelled"):
+            return
         accepted = {int(uid) for uid in agreement.get("accepted_by", [])}
-        agreement["status"] = "active" if participant_ids and participant_ids <= accepted else "pending"
+        agreement["status"] = "active" if len(accepted) >= 2 else "pending"
+        if agreement["status"] == "active" and not agreement.get("activated_at"):
+            agreement["activated_at"] = datetime.now(timezone.utc).isoformat()
 
-    def create_challenge(self, creator: UserConfig, title: str, target: Optional[int]) -> dict:
+    def create_challenge(
+        self,
+        creator: UserConfig,
+        title: str,
+        target: Optional[int],
+        deadline: Optional[str] = None,
+    ) -> dict:
         title = title.strip()
         if not title:
-            raise ValueError("Use: /challenge [target] <title>")
+            raise ValueError("Use: /challenge [target] <title> [for 7d | until YYYY-MM-DD]")
         challenges = self.state.setdefault("challenges", [])
         challenge = {
             "id": next_item_id(challenges, "c"),
             "title": title,
             "target": target,
+            "deadline": deadline,
             "creator_id": creator.id,
             "creator_name": creator.name,
             "scores": {},
+            "daily": {},
+            "participants": {str(creator.id): creator.name},
+            "winner_ids": [],
             "status": "active",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -361,19 +439,84 @@ class Ledger:
         self._save()
         return challenge
 
-    def add_challenge_score(self, challenge_id: str, user: UserConfig, amount: int) -> dict:
-        if amount <= 0:
-            raise ValueError("Score must be positive.")
+    def add_challenge_score(
+        self, challenge_id: str, user: UserConfig, amount: int
+    ) -> Tuple[dict, bool]:
+        """Apply a score change. Returns (challenge, completed_now).
+
+        Negative amounts correct mistakes; totals never go below zero.
+        Hitting the target completes the challenge on the spot.
+        """
+        if amount == 0:
+            raise ValueError("Score change cannot be zero.")
+        challenge = self.find_challenge(challenge_id)
+        if not challenge:
+            raise ValueError(f"Challenge {challenge_id} was not found.")
+        today = datetime.now(timezone.utc).date()
+        if challenge.get("status") == "active" and challenge_expired(challenge, today):
+            self._finalize_challenge(challenge, "ended")
+            self._save()
+            raise ValueError(
+                f"Challenge {challenge['id']} hit its deadline "
+                f"({challenge.get('deadline')}) and is now closed. See /challenges done."
+            )
+        if challenge.get("status") != "active":
+            raise ValueError(f"Challenge {challenge_id} is not active.")
+        scores = challenge.setdefault("scores", {})
+        user_key = str(user.id)
+        old_total = int(scores.get(user_key, 0))
+        new_total = max(0, old_total + int(amount))
+        applied = new_total - old_total
+        scores[user_key] = new_total
+        day_key = today.isoformat()
+        daily = challenge.setdefault("daily", {}).setdefault(user_key, {})
+        daily[day_key] = max(0, int(daily.get(day_key, 0)) + applied)
+        challenge.setdefault("participants", {})[user_key] = user.name
+        completed = False
+        target = challenge.get("target")
+        if target and new_total >= int(target):
+            self._finalize_challenge(challenge, "completed", winner_ids=[user.id])
+            completed = True
+        self._save()
+        return challenge, completed
+
+    def finish_challenge(self, challenge_id: str, user: UserConfig) -> dict:
         challenge = self.find_challenge(challenge_id)
         if not challenge:
             raise ValueError(f"Challenge {challenge_id} was not found.")
         if challenge.get("status") != "active":
             raise ValueError(f"Challenge {challenge_id} is not active.")
-        scores = challenge.setdefault("scores", {})
-        user_key = str(user.id)
-        scores[user_key] = int(scores.get(user_key, 0)) + amount
+        if int(challenge.get("creator_id", 0)) != user.id:
+            raise ValueError("Only the creator can end a challenge early.")
+        self._finalize_challenge(challenge, "ended")
         self._save()
         return challenge
+
+    def expire_due_challenges(self, today) -> List[dict]:
+        ended = []
+        for challenge in self.state.get("challenges", []):
+            if challenge.get("status") == "active" and challenge_expired(challenge, today):
+                self._finalize_challenge(challenge, "ended")
+                ended.append(challenge)
+        if ended:
+            self._save()
+        return ended
+
+    def _finalize_challenge(
+        self, challenge: dict, status: str, winner_ids: Optional[List[int]] = None
+    ) -> None:
+        if winner_ids is None:
+            scores: Dict[int, int] = {}
+            for raw_uid, value in (challenge.get("scores", {}) or {}).items():
+                try:
+                    scores[int(raw_uid)] = int(value)
+                except (TypeError, ValueError):
+                    continue
+            top = max(scores.values(), default=0)
+            winner_ids = [uid for uid, value in scores.items() if value == top and top > 0]
+        challenge["status"] = status
+        challenge["winner_ids"] = winner_ids
+        challenge["finished_at"] = datetime.now(timezone.utc).isoformat()
 
     def latest_active_challenge(self) -> Optional[dict]:
         for challenge in reversed(self.state.get("challenges", [])):
@@ -382,7 +525,9 @@ class Ledger:
         return None
 
     def find_challenge(self, challenge_id: str) -> Optional[dict]:
-        wanted = challenge_id.strip().lower()
+        wanted = str(challenge_id or "").strip().lower()
+        if not wanted:
+            return None
         for challenge in self.state.get("challenges", []):
             if str(challenge.get("id", "")).lower() == wanted:
                 return challenge
@@ -556,7 +701,10 @@ AMOUNT_PATTERN = re.compile(
 )
 SETTLEMENT_PATTERN = re.compile(r"^\s*(.*)$")
 PUSHUPS_PATTERN = re.compile(r"^\s*(\d+)\s*(?:push[-\s]?ups?)?\s*$", re.IGNORECASE)
-CHALLENGE_PATTERN = re.compile(r"^\s*(?:(\d+)\s+)?(.+?)\s*$")
+CHALLENGE_UNTIL_PATTERN = re.compile(r"\s+until\s+(\d{4}-\d{2}-\d{2})\s*$", re.IGNORECASE)
+CHALLENGE_FOR_PATTERN = re.compile(r"\s+for\s+(\d+)\s*(d|days?|w|weeks?)\s*$", re.IGNORECASE)
+CHALLENGE_TARGET_PATTERN = re.compile(r"^(\d+)\s+(.+)$")
+SCORE_AMOUNT_PATTERN = re.compile(r"^[+-]?\d+$")
 
 
 def next_item_id(items: List[dict], prefix: str) -> str:
@@ -612,13 +760,74 @@ def parse_pushups_text(text: str) -> int:
     return count
 
 
-def parse_challenge_text(text: str) -> Tuple[Optional[int], str]:
-    match = CHALLENGE_PATTERN.match(text or "")
-    if not match:
-        raise ValueError("Use: /challenge [target] <title>")
-    target_raw, title = match.groups()
-    target = int(target_raw) if target_raw else None
-    return target, title.strip()
+CHALLENGE_USAGE = "Use: /challenge [target] <title> [for 7d | until YYYY-MM-DD]"
+
+
+def parse_challenge_text(text: str, today) -> Tuple[Optional[int], str, Optional[str]]:
+    """Parse '/challenge [target] <title> [for Nd|Nw | until YYYY-MM-DD]'.
+
+    Returns (target, title, deadline_iso). The deadline is the last day
+    scoring is allowed (inclusive).
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError(CHALLENGE_USAGE)
+
+    deadline: Optional[str] = None
+    match = CHALLENGE_UNTIL_PATTERN.search(text)
+    if match:
+        try:
+            deadline_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("Deadline must be a valid date like 2026-07-20.") from exc
+        if deadline_date < today:
+            raise ValueError("That deadline is already in the past.")
+        deadline = deadline_date.isoformat()
+        text = text[: match.start()].strip()
+    else:
+        match = CHALLENGE_FOR_PATTERN.search(text)
+        if match:
+            count = int(match.group(1))
+            if count <= 0:
+                raise ValueError("Duration must be positive.")
+            days = count * 7 if match.group(2).lower().startswith("w") else count
+            deadline = (today + timedelta(days=days)).isoformat()
+            text = text[: match.start()].strip()
+
+    target: Optional[int] = None
+    match = CHALLENGE_TARGET_PATTERN.match(text)
+    if match:
+        target = int(match.group(1))
+        text = match.group(2).strip()
+    if not text or text.isdigit():
+        raise ValueError(CHALLENGE_USAGE)
+    return target, text, deadline
+
+
+def challenge_expired(challenge: dict, today) -> bool:
+    deadline = challenge.get("deadline")
+    if not deadline:
+        return False
+    try:
+        deadline_date = datetime.strptime(str(deadline), "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return today > deadline_date
+
+
+def challenge_streak(challenge: dict, user_id: int, today) -> int:
+    """Consecutive days with progress, counting back from today (or yesterday
+    if today has no entry yet, so an unbroken streak isn't shown as 0)."""
+    daily = challenge.get("daily", {}).get(str(user_id), {})
+    days = {day for day, value in daily.items() if int(value) > 0}
+    day = today
+    if day.isoformat() not in days:
+        day = day - timedelta(days=1)
+    streak = 0
+    while day.isoformat() in days:
+        streak += 1
+        day -= timedelta(days=1)
+    return streak
 
 
 def to_base(amount: float, currency: str, config: BotConfig) -> float:
@@ -728,26 +937,124 @@ def format_pushup_standings(
     return "\n".join(lines)
 
 
+STATUS_ICONS = {
+    "pending": "🕓",
+    "active": "🟢",
+    "revoked": "🗑",
+    "cancelled": "🗑",
+    "completed": "🏁",
+    "ended": "🏁",
+}
+
+
+def display_name(user_id: int, participants: Dict[str, Any], config: BotConfig) -> str:
+    user = user_from_id(user_id, config)
+    if user:
+        return user.name
+    name = participants.get(str(user_id))
+    if name:
+        return str(name)
+    return f"user {user_id}"
+
+
+def progress_bar(value: int, target: int, width: int = 10) -> str:
+    if target <= 0:
+        return ""
+    ratio = min(1.0, max(0.0, value / target))
+    filled = int(round(ratio * width))
+    return "▰" * filled + "▱" * (width - filled) + f" {int(ratio * 100)}%"
+
+
 def format_agreement(agreement: dict, config: BotConfig) -> str:
-    accepted = {int(uid) for uid in agreement.get("accepted_by", [])}
-    accepted_names = [
-        user.name for user in config.users if user.id in accepted
-    ] or ["Nobody yet"]
+    participants = agreement.get("participants", {}) or {}
+    accepted = [int(uid) for uid in agreement.get("accepted_by", [])]
+    declined = [int(uid) for uid in agreement.get("declined_by", [])]
     status = agreement.get("status", "pending")
-    return (
-        f"{agreement.get('id')}: {agreement.get('text')}\n"
-        f"Status: {status}. Accepted by: {', '.join(accepted_names)}"
-    )
+    icon = STATUS_ICONS.get(status, "")
+    lines = [f"📜 {agreement.get('id')} — {agreement.get('text')}"]
+    lines.append(f"Status: {icon} {status}".rstrip())
+    if accepted:
+        lines.append("✅ " + ", ".join(display_name(uid, participants, config) for uid in accepted))
+    else:
+        lines.append("✅ nobody yet")
+    if declined:
+        lines.append("❌ " + ", ".join(display_name(uid, participants, config) for uid in declined))
+    if status == "pending":
+        waiting = [
+            user.name
+            for user in config.users
+            if user.id not in accepted and user.id not in declined
+        ]
+        if waiting:
+            lines.append("Waiting on: " + ", ".join(waiting))
+    breaches = agreement.get("breaches", [])
+    if breaches:
+        counts: Dict[int, int] = {}
+        for breach in breaches:
+            offender = int(breach.get("user_id", 0))
+            counts[offender] = counts.get(offender, 0) + 1
+        strikes = ", ".join(
+            f"{display_name(uid, participants, config)} ×{count}"
+            for uid, count in sorted(counts.items(), key=lambda kv: -kv[1])
+        )
+        lines.append(f"⚠️ Breaches: {strikes}")
+        last = breaches[-1]
+        note = str(last.get("note") or "").strip()
+        latest = f"   latest: {display_name(int(last.get('user_id', 0)), participants, config)}"
+        if note:
+            latest += f" — “{note}”"
+        lines.append(latest)
+    return "\n".join(lines)
 
 
-def format_challenge(challenge: dict, config: BotConfig) -> str:
-    scores = challenge.get("scores", {})
-    lines = [f"{challenge.get('id')}: {challenge.get('title')}"]
+def format_challenge(challenge: dict, config: BotConfig, today=None) -> str:
+    today = today or datetime.now(timezone.utc).date()
+    participants = challenge.get("participants", {}) or {}
+    scores: Dict[int, int] = {}
+    for raw_uid, value in (challenge.get("scores", {}) or {}).items():
+        try:
+            scores[int(raw_uid)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    for user in config.users:
+        scores.setdefault(user.id, 0)
+
+    status = challenge.get("status", "active")
+    icon = STATUS_ICONS.get(status, "")
     target = challenge.get("target")
+    deadline = challenge.get("deadline")
+    meta = []
     if target:
-        lines[0] += f" (target {target})"
-    for user in sorted(config.users, key=lambda u: int(scores.get(str(u.id), 0)), reverse=True):
-        lines.append(f"- {user.name}: {int(scores.get(str(user.id), 0))}")
+        meta.append(f"target {target}")
+    if deadline:
+        if status == "active":
+            try:
+                days_left = (datetime.strptime(str(deadline), "%Y-%m-%d").date() - today).days
+                meta.append(
+                    f"ends {deadline} ({days_left}d left)" if days_left >= 0 else f"ended {deadline}"
+                )
+            except ValueError:
+                meta.append(f"ends {deadline}")
+        else:
+            meta.append(f"deadline {deadline}")
+    header = f"🏆 {challenge.get('id')} — {challenge.get('title')}"
+    if meta:
+        header += " (" + ", ".join(meta) + ")"
+
+    lines = [header, f"Status: {icon} {status}".rstrip()]
+    if target:
+        bar = progress_bar(max(scores.values(), default=0), int(target))
+        if bar:
+            lines.append(bar)
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    for rank, (uid, total) in enumerate(ranked, start=1):
+        streak = challenge_streak(challenge, uid, today) if status == "active" else 0
+        streak_note = f" 🔥{streak}d" if streak >= 2 else ""
+        lines.append(f"{rank}. {display_name(uid, participants, config)} — {total}{streak_note}")
+    winner_ids = challenge.get("winner_ids") or []
+    if status in ("completed", "ended") and winner_ids:
+        names = ", ".join(display_name(int(uid), participants, config) for uid in winner_ids)
+        lines.append(f"🏆 Winner: {names}")
     return "\n".join(lines)
 
 
@@ -767,12 +1074,78 @@ def get_runtime_for_update(
     return store.ledger_for(instance_id), store.config_for(base_config, instance_id)
 
 
+def runtime_for_instance(
+    context: ContextTypes.DEFAULT_TYPE, instance_id: str
+) -> Optional[Tuple[Ledger, BotConfig]]:
+    """Resolve a ledger/config from an explicit instance id (used by inline
+    buttons, whose callback data pins the instance they were created for)."""
+    store: InstanceStore = context.application.bot_data["store"]
+    base_config: BotConfig = context.application.bot_data["base_config"]
+    if instance_id not in store.state.get("instances", {}):
+        return None
+    return store.ledger_for(instance_id), store.config_for(base_config, instance_id)
+
+
 def user_state_key(config: BotConfig, user_id: int, name: str) -> str:
     return f"{name}:{config.instance_id}:{user_id}"
 
 
 def user_from_id(user_id: int, config: BotConfig) -> Optional[UserConfig]:
     return next((u for u in config.users if u.id == user_id), None)
+
+
+def resolve_participant(user: Any, config: BotConfig) -> Optional[UserConfig]:
+    """Who is acting in a challenge/agreement flow.
+
+    The default DM instance keeps its fixed roster. Group instances are open:
+    anyone present in the chat can agree, accept, and score without touching
+    the expense-splitting member list (/join stays opt-in for money).
+    """
+    member = user_from_id(user.id, config)
+    if member:
+        return member
+    if config.instance_id == "default":
+        return None
+    name = getattr(user, "full_name", None) or getattr(user, "username", None) or str(user.id)
+    return UserConfig(id=user.id, name=str(name))
+
+
+def match_participant(token: str, item: dict, config: BotConfig) -> Optional[UserConfig]:
+    """Match a typed name (or @name) against known participants of an item."""
+    wanted = token.lstrip("@").strip().lower()
+    if not wanted:
+        return None
+    candidates: Dict[int, str] = {user.id: user.name for user in config.users}
+    for raw_uid, name in (item.get("participants", {}) or {}).items():
+        try:
+            candidates[int(raw_uid)] = str(name)
+        except (TypeError, ValueError):
+            continue
+    for uid, name in candidates.items():
+        if name.lower() == wanted:
+            return UserConfig(id=uid, name=name)
+    for uid, name in candidates.items():
+        if name.lower().startswith(wanted):
+            return UserConfig(id=uid, name=name)
+    return None
+
+
+async def announce_to_instance(
+    context: ContextTypes.DEFAULT_TYPE,
+    config: BotConfig,
+    current_chat_id: Optional[int],
+    text: str,
+) -> None:
+    """Mirror a noteworthy event to the instance's home group chat when the
+    triggering action happened somewhere else (e.g. a DM via /use)."""
+    store: InstanceStore = context.application.bot_data["store"]
+    instance = store.state.get("instances", {}).get(config.instance_id) or {}
+    chat_id = instance.get("chat_id")
+    if chat_id and chat_id != current_chat_id:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as exc:
+            logger.warning("Failed to announce to instance chat %s: %s", chat_id, exc)
 
 def available_currencies(config: BotConfig) -> List[str]:
     codes = set([config.base_currency])
@@ -799,9 +1172,44 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🕑 History", callback_data=f"{CB_MENU_PREFIX}history"),
             ],
             [InlineKeyboardButton("✅ Settle", callback_data=f"{CB_MENU_PREFIX}settle")],
+            [
+                InlineKeyboardButton("🏆 Challenges", callback_data=f"{CB_MENU_PREFIX}challenges"),
+                InlineKeyboardButton("🤝 Agreements", callback_data=f"{CB_MENU_PREFIX}agreements"),
+            ],
             [InlineKeyboardButton("💪 Push-ups", callback_data=f"{CB_MENU_PREFIX}pushups")],
             [InlineKeyboardButton("🏅 Standings", callback_data=f"{CB_MENU_PREFIX}pushups_standings")],
             [InlineKeyboardButton("ℹ️ Help", callback_data=f"{CB_MENU_PREFIX}help")],
+        ]
+    )
+
+
+def agreement_keyboard(instance_id: str, agreement_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Accept", callback_data=f"agr|a|{instance_id}|{agreement_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Decline", callback_data=f"agr|d|{instance_id}|{agreement_id}"
+                ),
+            ]
+        ]
+    )
+
+
+def challenge_keyboard(instance_id: str, challenge_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("+1", callback_data=f"chl|s|{instance_id}|{challenge_id}|1"),
+                InlineKeyboardButton("+5", callback_data=f"chl|s|{instance_id}|{challenge_id}|5"),
+                InlineKeyboardButton("+10", callback_data=f"chl|s|{instance_id}|{challenge_id}|10"),
+            ],
+            [
+                InlineKeyboardButton("📊 Standings", callback_data=f"chl|v|{instance_id}|{challenge_id}"),
+                InlineKeyboardButton("🏁 End", callback_data=f"chl|e|{instance_id}|{challenge_id}"),
+            ],
         ]
     )
 
@@ -827,6 +1235,10 @@ CB_CURRENCY_PREFIX = "currency:"
 CB_MENU_PREFIX = "menu:"
 CB_PUSHUPS_PREFIX = "pushups:"
 CB_PUSHUPS_ADD_PREFIX = f"{CB_PUSHUPS_PREFIX}add:"
+# Agreement/challenge callbacks use '|' separators because instance ids
+# contain ':' (e.g. "chat:-100123"). Shape: agr|<action>|<instance>|<id>
+CB_AGREEMENT_PREFIX = "agr|"
+CB_CHALLENGE_PREFIX = "chl|"
 
 
 async def currency_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -882,22 +1294,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, config = get_runtime_for_update(update, context)
     names = " & ".join([u.name for u in config.users]) or "No participants yet"
     help_text = (
-        "Shared travel bot is online.\n"
+        "Shared group bot is online.\n"
         "Add expenses by sending: `<amount> [CUR] <description>`\n"
         f"If no currency is given, I'll ask (options: {', '.join(available_currencies(config))}).\n"
-        "or `/add <amount> [CUR] <description>`.\n"
         "Push-ups: `/pushups <count>` or tap the push-up buttons.\n\n"
-        "Commands:\n"
-        "- /add 23.50 dinner\n"
-        "- /balance\n"
-        "- /history\n\n"
-        "- /settle [comment]  (records who owed whom, marks it paid, and clears expenses)\n\n"
-        "- /join  (subscribe to this group instance)\n"
-        "- /agree <text> and /accept [id]\n"
-        "- /challenge [target] <title> and /score [id] <amount>\n\n"
+        "Money:\n"
+        "- /add 23.50 dinner, /balance, /history\n"
+        "- /settle [comment]  (records who owed whom, marks it paid, clears expenses)\n"
+        "- /join / /leave  (opt in/out of expense splitting in this group)\n\n"
+        "Agreements 🤝:\n"
+        "- /agree <text>  (propose; active once two people accept)\n"
+        "- /accept [id], /decline [id], /revoke <id>\n"
+        "- /breach [id] [name] [note]  (record a broken agreement — reply to someone to blame them)\n"
+        "- /agreements [all|active|pending]\n\n"
+        "Challenges 🏆:\n"
+        "- /challenge [target] <title> [for 7d | until YYYY-MM-DD]\n"
+        "- /score [id] <amount>  (negative corrects mistakes)\n"
+        "- /challenges [all|done], /endchallenge [id]\n\n"
         f"Instance: {config.instance_name} (`{config.instance_id}`)\n"
-        f"Participants: {names}\n"
-        "Every entry is split evenly between both people.\n\n"
+        f"Expense participants: {names}\n"
+        "Expenses are split evenly between joined participants.\n\n"
         "Use the inline menu below for quick actions."
     )
     await update.message.reply_text(help_text, reply_markup=main_menu_keyboard())
@@ -1090,14 +1506,62 @@ async def use_instance_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"Active DM instance set to {config.instance_name}.")
 
 
+PARTICIPANT_GATE_TEXT = "You're not on the participant list for this instance."
+
+
+def build_agreement_list(ledger: Ledger, config: BotConfig, which: str) -> str:
+    agreements = ledger.state.get("agreements", [])
+    if which == "all":
+        selected = agreements
+    elif which in ("active", "pending"):
+        selected = [a for a in agreements if a.get("status") == which]
+    else:
+        which = "open"
+        selected = [a for a in agreements if a.get("status") in ("pending", "active")]
+    selected = selected[-10:]
+    if not selected:
+        return f"No {which} agreements here. Propose one with /agree <text>."
+    return f"Agreements ({which}):\n\n" + "\n\n".join(
+        format_agreement(a, config) for a in selected
+    )
+
+
+def build_challenge_list(
+    ledger: Ledger, config: BotConfig, which: str, today
+) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    challenges = ledger.state.get("challenges", [])
+    if which == "all":
+        selected = challenges
+    elif which in ("done", "finished", "completed", "ended"):
+        which = "done"
+        selected = [c for c in challenges if c.get("status") in ("completed", "ended")]
+    else:
+        which = "active"
+        selected = [c for c in challenges if c.get("status") == "active"]
+    selected = selected[-10:]
+    if not selected:
+        return (
+            f"No {which} challenges here. Start one with {CHALLENGE_USAGE[5:]}",
+            None,
+        )
+    text = f"Challenges ({which}):\n\n" + "\n\n".join(
+        format_challenge(c, config, today) for c in selected
+    )
+    active = [c for c in selected if c.get("status") == "active"]
+    keyboard = (
+        challenge_keyboard(config.instance_id, str(active[-1]["id"])) if active else None
+    )
+    return text, keyboard
+
+
 async def agree_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ledger, config = get_runtime_for_update(update, context)
     user = update.effective_user
     if not user or not update.message:
         return
-    actor = user_from_id(user.id, config)
+    actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text("Join this instance first with /join.")
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
         return
     text = " ".join(context.args)
     try:
@@ -1106,40 +1570,146 @@ async def agree_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(str(exc))
         return
     await update.message.reply_text(
-        f"Agreement proposed.\n{format_agreement(agreement, config)}\n"
-        f"Participants can accept with /accept {agreement['id']}."
+        f"Agreement proposed by {actor.name}.\n\n"
+        f"{format_agreement(agreement, config)}\n\n"
+        "Tap a button or use /accept, /decline. It takes effect once two people are in.",
+        reply_markup=agreement_keyboard(config.instance_id, str(agreement["id"])),
     )
 
 
-async def accept_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def respond_agreement_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, accept: bool
+) -> None:
     ledger, config = get_runtime_for_update(update, context)
     user = update.effective_user
     if not user or not update.message:
         return
-    actor = user_from_id(user.id, config)
+    actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text("Join this instance first with /join.")
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
         return
     agreement_id = context.args[0] if context.args else None
-    agreement = ledger.find_agreement(agreement_id) if agreement_id else ledger.latest_pending_agreement()
+    agreement = (
+        ledger.find_agreement(agreement_id) if agreement_id else ledger.latest_open_agreement()
+    )
     if not agreement:
-        await update.message.reply_text("No pending agreement found.")
+        await update.message.reply_text("No matching agreement found. See /agreements.")
         return
+    was_active = agreement.get("status") == "active"
     try:
-        agreement = ledger.accept_agreement(str(agreement["id"]), actor)
+        agreement = ledger.respond_agreement(str(agreement["id"]), actor, accept=accept)
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
-    await update.message.reply_text(format_agreement(agreement, config))
+    text = format_agreement(agreement, config)
+    if not was_active and agreement.get("status") == "active":
+        text = "🤝 Agreement is now ACTIVE.\n\n" + text
+        await announce_to_instance(
+            context,
+            config,
+            update.effective_chat.id if update.effective_chat else None,
+            text,
+        )
+    keyboard = (
+        agreement_keyboard(config.instance_id, str(agreement["id"]))
+        if agreement.get("status") in ("pending", "active")
+        else None
+    )
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def accept_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await respond_agreement_command(update, context, accept=True)
+
+
+async def decline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await respond_agreement_command(update, context, accept=False)
+
+
+async def revoke_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = resolve_participant(user, config)
+    if not actor:
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        return
+    if not context.args:
+        await update.message.reply_text("Use: /revoke <agreement_id>")
+        return
+    try:
+        agreement = ledger.revoke_agreement(context.args[0], actor)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    text = f"Agreement revoked by {actor.name}.\n\n{format_agreement(agreement, config)}"
+    await update.message.reply_text(text)
+    await announce_to_instance(
+        context, config, update.effective_chat.id if update.effective_chat else None, text
+    )
+
+
+async def breach_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = resolve_participant(user, config)
+    if not actor:
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        return
+    args = list(context.args or [])
+    agreement = None
+    if args:
+        agreement = ledger.find_agreement(args[0])
+        if agreement:
+            args.pop(0)
+    if not agreement:
+        agreement = ledger.latest_active_agreement()
+    if not agreement:
+        await update.message.reply_text(
+            "No active agreement found. Use: /breach [agreement_id] [name] [note]"
+        )
+        return
+
+    offender: Optional[UserConfig] = None
+    reply = update.message.reply_to_message
+    if reply and reply.from_user:
+        offender = UserConfig(
+            id=reply.from_user.id,
+            name=reply.from_user.full_name or str(reply.from_user.id),
+        )
+    elif args:
+        offender = match_participant(args[0], agreement, config)
+        if offender:
+            args.pop(0)
+    if offender is None:
+        offender = actor  # owning up to it yourself
+
+    note = " ".join(args).strip()
+    try:
+        agreement = ledger.record_breach(str(agreement["id"]), offender, actor, note)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    strikes = sum(
+        1 for b in agreement.get("breaches", []) if int(b.get("user_id", 0)) == offender.id
+    )
+    text = (
+        f"⚠️ Breach recorded against {offender.name} (strike {strikes}).\n\n"
+        f"{format_agreement(agreement, config)}"
+    )
+    await update.message.reply_text(text)
+    await announce_to_instance(
+        context, config, update.effective_chat.id if update.effective_chat else None, text
+    )
 
 
 async def agreements_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ledger, config = get_runtime_for_update(update, context)
-    agreements = ledger.state.get("agreements", [])[-10:]
-    if not agreements:
-        await update.message.reply_text("No agreements yet.")
-        return
-    await update.message.reply_text("\n\n".join(format_agreement(a, config) for a in agreements))
+    which = context.args[0].lower() if context.args else "open"
+    await update.message.reply_text(build_agreement_list(ledger, config, which))
 
 
 async def challenge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1147,19 +1717,21 @@ async def challenge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user = update.effective_user
     if not user or not update.message:
         return
-    actor = user_from_id(user.id, config)
+    actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text("Join this instance first with /join.")
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
         return
+    today = datetime.now(timezone.utc).date()
     try:
-        target, title = parse_challenge_text(" ".join(context.args))
-        challenge = ledger.create_challenge(actor, title, target)
+        target, title, deadline = parse_challenge_text(" ".join(context.args), today)
+        challenge = ledger.create_challenge(actor, title, target, deadline)
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
     await update.message.reply_text(
-        f"Challenge created.\n{format_challenge(challenge, config)}\n"
-        f"Log progress with /score {challenge['id']} <amount>."
+        f"Challenge on! 🏁\n\n{format_challenge(challenge, config, today)}\n\n"
+        f"Log progress with the buttons or /score {challenge['id']} <amount>.",
+        reply_markup=challenge_keyboard(config.instance_id, str(challenge["id"])),
     )
 
 
@@ -1168,39 +1740,214 @@ async def score_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     if not user or not update.message:
         return
-    actor = user_from_id(user.id, config)
+    actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text("Join this instance first with /join.")
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
         return
-    if len(context.args) == 1:
+    args = list(context.args or [])
+    challenge_id: Optional[str] = None
+    if len(args) == 1 and SCORE_AMOUNT_PATTERN.match(args[0]):
+        raw_amount = args[0]
+    elif len(args) >= 2:
+        challenge_id, raw_amount = args[0], args[1]
+    else:
+        await update.message.reply_text(
+            "Use: /score [challenge_id] <amount> — e.g. /score 20, or /score c2 -5 to correct."
+        )
+        return
+    if challenge_id is None:
         challenge = ledger.latest_active_challenge()
         if not challenge:
-            await update.message.reply_text("No active challenge found.")
+            await update.message.reply_text("No active challenge. Start one with /challenge.")
             return
         challenge_id = str(challenge["id"])
-        raw_amount = context.args[0]
-    elif len(context.args) >= 2:
-        challenge_id = context.args[0]
-        raw_amount = context.args[1]
-    else:
-        await update.message.reply_text("Use: /score [challenge_id] <amount>")
+    if not SCORE_AMOUNT_PATTERN.match(raw_amount):
+        await update.message.reply_text(f"'{raw_amount}' is not a whole number.")
         return
     try:
-        amount = int(raw_amount)
-        challenge = ledger.add_challenge_score(challenge_id, actor, amount)
+        challenge, completed = ledger.add_challenge_score(challenge_id, actor, int(raw_amount))
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
-    await update.message.reply_text(format_challenge(challenge, config))
+    today = datetime.now(timezone.utc).date()
+    text = format_challenge(challenge, config, today)
+    if completed:
+        text = f"🎉 {actor.name} hit the target — challenge complete!\n\n" + text
+        await update.message.reply_text(text)
+        await announce_to_instance(
+            context, config, update.effective_chat.id if update.effective_chat else None, text
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=challenge_keyboard(config.instance_id, str(challenge["id"]))
+        )
+
+
+async def end_challenge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = resolve_participant(user, config)
+    if not actor:
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        return
+    challenge = (
+        ledger.find_challenge(context.args[0])
+        if context.args
+        else ledger.latest_active_challenge()
+    )
+    if not challenge:
+        await update.message.reply_text("No active challenge found.")
+        return
+    try:
+        challenge = ledger.finish_challenge(str(challenge["id"]), actor)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    today = datetime.now(timezone.utc).date()
+    text = "🏁 Challenge ended.\n\n" + format_challenge(challenge, config, today)
+    await update.message.reply_text(text)
+    await announce_to_instance(
+        context, config, update.effective_chat.id if update.effective_chat else None, text
+    )
 
 
 async def challenges_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ledger, config = get_runtime_for_update(update, context)
-    challenges = ledger.state.get("challenges", [])[-10:]
-    if not challenges:
-        await update.message.reply_text("No challenges yet.")
+    today = datetime.now(timezone.utc).date()
+    ledger.expire_due_challenges(today)
+    which = context.args[0].lower() if context.args else "active"
+    text, keyboard = build_challenge_list(ledger, config, which, today)
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def agreement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
         return
-    await update.message.reply_text("\n\n".join(format_challenge(c, config) for c in challenges))
+    parts = (query.data or "").split("|")
+    if len(parts) != 4:
+        await query.answer()
+        return
+    _, action, instance_id, agreement_id = parts
+    runtime = runtime_for_instance(context, instance_id)
+    if not runtime:
+        await query.answer("This instance no longer exists.", show_alert=True)
+        return
+    ledger, config = runtime
+    actor = resolve_participant(query.from_user, config)
+    if not actor:
+        await query.answer(PARTICIPANT_GATE_TEXT, show_alert=True)
+        return
+    agreement = ledger.find_agreement(agreement_id)
+    if not agreement:
+        await query.answer("Agreement not found.", show_alert=True)
+        return
+    was_active = agreement.get("status") == "active"
+    try:
+        agreement = ledger.respond_agreement(agreement_id, actor, accept=(action == "a"))
+    except ValueError as exc:
+        await query.answer(str(exc), show_alert=True)
+        return
+    await query.answer("Accepted ✅" if action == "a" else "Declined ❌")
+    text = format_agreement(agreement, config)
+    if not was_active and agreement.get("status") == "active":
+        text = "🤝 Agreement is now ACTIVE.\n\n" + text
+        await announce_to_instance(
+            context, config, query.message.chat.id if query.message else None, text
+        )
+    keyboard = (
+        agreement_keyboard(instance_id, agreement_id)
+        if agreement.get("status") in ("pending", "active")
+        else None
+    )
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        pass  # message unchanged (double tap) or no longer editable
+
+
+async def challenge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    parts = (query.data or "").split("|")
+    if len(parts) < 4:
+        await query.answer()
+        return
+    action, instance_id, challenge_id = parts[1], parts[2], parts[3]
+    runtime = runtime_for_instance(context, instance_id)
+    if not runtime:
+        await query.answer("This instance no longer exists.", show_alert=True)
+        return
+    ledger, config = runtime
+    today = datetime.now(timezone.utc).date()
+
+    if action == "v":
+        challenge = ledger.find_challenge(challenge_id)
+        if not challenge:
+            await query.answer("Challenge not found.", show_alert=True)
+            return
+        await query.answer()
+        if query.message:
+            keyboard = (
+                challenge_keyboard(instance_id, challenge_id)
+                if challenge.get("status") == "active"
+                else None
+            )
+            await query.message.reply_text(
+                format_challenge(challenge, config, today), reply_markup=keyboard
+            )
+        return
+
+    actor = resolve_participant(query.from_user, config)
+    if not actor:
+        await query.answer(PARTICIPANT_GATE_TEXT, show_alert=True)
+        return
+
+    if action == "e":
+        try:
+            challenge = ledger.finish_challenge(challenge_id, actor)
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        await query.answer("Challenge ended.")
+        text = "🏁 Challenge ended.\n\n" + format_challenge(challenge, config, today)
+        try:
+            await query.edit_message_text(text)
+        except Exception:
+            pass
+        await announce_to_instance(
+            context, config, query.message.chat.id if query.message else None, text
+        )
+        return
+
+    if action == "s" and len(parts) == 5:
+        try:
+            amount = int(parts[4])
+        except ValueError:
+            await query.answer()
+            return
+        try:
+            challenge, completed = ledger.add_challenge_score(challenge_id, actor, amount)
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        await query.answer(f"+{amount} for {actor.name}")
+        text = format_challenge(challenge, config, today)
+        keyboard = None
+        if completed:
+            text = f"🎉 {actor.name} hit the target — challenge complete!\n\n" + text
+            await announce_to_instance(
+                context, config, query.message.chat.id if query.message else None, text
+            )
+        else:
+            keyboard = challenge_keyboard(instance_id, challenge_id)
+        try:
+            await query.edit_message_text(text, reply_markup=keyboard)
+        except Exception:
+            pass
 
 
 async def healthcheck(app: Application, config: BotConfig) -> None:
@@ -1495,13 +2242,28 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     data = query.data or ""
     if not data.startswith(CB_MENU_PREFIX):
         return
+
+    action = data[len(CB_MENU_PREFIX) :]
+    # Challenge/agreement views are open to everyone in the instance's chat;
+    # the expense-roster gate below only applies to money actions.
+    if action == "challenges":
+        if query.message:
+            today = datetime.now(timezone.utc).date()
+            ledger.expire_due_challenges(today)
+            text, keyboard = build_challenge_list(ledger, config, "active", today)
+            await query.message.reply_text(text, reply_markup=keyboard)
+        return
+    if action == "agreements":
+        if query.message:
+            await query.message.reply_text(build_agreement_list(ledger, config, "open"))
+        return
+
     actor = user_from_id(query.from_user.id, config)
     if not actor:
         if query.message:
             await query.message.reply_text("You're not on the traveler list for this bot.")
         return
 
-    action = data[len(CB_MENU_PREFIX) :]
     if action == "add_expense":
         if query.message:
             await query.message.reply_text(
@@ -1545,6 +2307,31 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "Menu:", reply_markup=main_menu_keyboard()
         )
+
+
+async def challenge_deadline_sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Close challenges whose deadline passed and announce final standings."""
+    store: InstanceStore = context.application.bot_data["store"]
+    base_config: BotConfig = context.application.bot_data["base_config"]
+    today = datetime.now(timezone.utc).date()
+    for instance_id in store.all_instance_ids():
+        ledger = store.ledger_for(instance_id)
+        config = store.config_for(base_config, instance_id)
+        ended = ledger.expire_due_challenges(today)
+        if not ended:
+            continue
+        instance = store.state.get("instances", {}).get(instance_id) or {}
+        chat_id = instance.get("chat_id")
+        recipients = [chat_id] if chat_id else [u.id for u in config.users]
+        for challenge in ended:
+            text = "⏰ Deadline reached.\n\n" + format_challenge(challenge, config, today)
+            for recipient in recipients:
+                try:
+                    await context.bot.send_message(chat_id=recipient, text=text)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send challenge deadline report to %s: %s", recipient, exc
+                    )
 
 
 async def pushups_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1592,11 +2379,22 @@ def build_application(config: BotConfig, store: InstanceStore) -> Application:
     application.bot_data["config"] = store.config_for(config, "default")
     application.bot_data["ledger"] = store.ledger_for("default")
 
-    application.job_queue.run_daily(
-        pushups_daily_report,
-        time=time(hour=0, minute=0, tzinfo=timezone.utc),
-        name="pushups-daily-report",
-    )
+    if application.job_queue is None:
+        logger.warning(
+            "JobQueue unavailable (install python-telegram-bot[job-queue]); "
+            "daily reports and deadline sweeps are disabled."
+        )
+    else:
+        application.job_queue.run_daily(
+            pushups_daily_report,
+            time=time(hour=0, minute=0, tzinfo=timezone.utc),
+            name="pushups-daily-report",
+        )
+        application.job_queue.run_daily(
+            challenge_deadline_sweep,
+            time=time(hour=0, minute=5, tzinfo=timezone.utc),
+            name="challenge-deadline-sweep",
+        )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
@@ -1608,10 +2406,14 @@ def build_application(config: BotConfig, store: InstanceStore) -> Application:
     application.add_handler(CommandHandler("use", use_instance_handler))
     application.add_handler(CommandHandler("agree", agree_handler))
     application.add_handler(CommandHandler("accept", accept_handler))
+    application.add_handler(CommandHandler("decline", decline_handler))
+    application.add_handler(CommandHandler("revoke", revoke_handler))
+    application.add_handler(CommandHandler("breach", breach_handler))
     application.add_handler(CommandHandler("agreements", agreements_handler))
     application.add_handler(CommandHandler("challenge", challenge_handler))
     application.add_handler(CommandHandler("score", score_handler))
     application.add_handler(CommandHandler("challenges", challenges_handler))
+    application.add_handler(CommandHandler("endchallenge", end_challenge_handler))
     application.add_handler(CommandHandler("add", add_expense_handler))
     application.add_handler(CommandHandler("balance", balance_handler))
     application.add_handler(CommandHandler("history", history_handler))
@@ -1635,6 +2437,8 @@ def build_application(config: BotConfig, store: InstanceStore) -> Application:
             pattern=f"^{CB_CURRENCY_PREFIX}",
         )
     )
+    application.add_handler(CallbackQueryHandler(agreement_callback, pattern=r"^agr\|"))
+    application.add_handler(CallbackQueryHandler(challenge_callback, pattern=r"^chl\|"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_text_handler))
     return application
 
