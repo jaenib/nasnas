@@ -294,7 +294,9 @@ class Ledger:
             enriched.append(copy)
         return sorted(enriched, key=lambda e: e.get("created_at", ""))[-limit:]
 
-    def create_agreement(self, creator: UserConfig, text: str) -> dict:
+    def create_agreement(
+        self, creator: UserConfig, text: str, checkin: Optional[dict] = None
+    ) -> dict:
         text = text.strip()
         if not text:
             raise ValueError("Use: /agree <agreement text>")
@@ -311,6 +313,8 @@ class Ledger:
             "status": "pending",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        if checkin:
+            agreement["checkin"] = checkin
         agreements.append(agreement)
         self._update_agreement_status(agreement)
         self._save()
@@ -322,6 +326,8 @@ class Ledger:
             raise ValueError(f"Agreement {agreement_id} was not found.")
         if agreement.get("status") in ("revoked", "cancelled"):
             raise ValueError(f"Agreement {agreement_id} was revoked.")
+        if agreement.get("status") == "completed":
+            raise ValueError(f"Agreement {agreement_id} already completed its period.")
         accepted = agreement.setdefault("accepted_by", [])
         declined = agreement.setdefault("declined_by", [])
         agreement.setdefault("participants", {})[str(user.id)] = user.name
@@ -376,6 +382,72 @@ class Ledger:
         self._save()
         return agreement
 
+    def record_checkin(
+        self, agreement_id: str, user: UserConfig, day_iso: str, success: bool
+    ) -> dict:
+        agreement = self.find_agreement(agreement_id)
+        if not agreement:
+            raise ValueError(f"Agreement {agreement_id} was not found.")
+        if agreement.get("status") in ("revoked", "cancelled"):
+            raise ValueError(f"Agreement {agreement_id} was revoked.")
+        if agreement.get("status") == "completed":
+            raise ValueError(f"Agreement {agreement_id} already completed its period.")
+        checkin = agreement.get("checkin")
+        if not checkin:
+            raise ValueError(f"Agreement {agreement_id} has no daily check-in.")
+        try:
+            day = datetime.strptime(day_iso, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("Invalid check-in date.") from exc
+        today = datetime.now(timezone.utc).date()
+        if day > today:
+            raise ValueError("You can't check in for the future.")
+        until = checkin.get("until")
+        if until and day_iso > str(until):
+            raise ValueError(f"This agreement's period ended on {until}.")
+        if not is_scheduled_day(checkin.get("days", "daily"), day):
+            raise ValueError("That day isn't part of this agreement's schedule.")
+        # Checking in is committing: it counts as accepting the agreement.
+        accepted = agreement.setdefault("accepted_by", [])
+        if user.id not in accepted:
+            declined = agreement.setdefault("declined_by", [])
+            if user.id in declined:
+                declined.remove(user.id)
+            accepted.append(user.id)
+            self._update_agreement_status(agreement)
+        agreement.setdefault("participants", {})[str(user.id)] = user.name
+        if agreement.get("status") != "active":
+            self._save()
+            raise ValueError(
+                "You're in, but the agreement needs a second acceptor before "
+                "check-ins count."
+            )
+        log = checkin.setdefault("log", {}).setdefault(str(user.id), {})
+        log[day_iso] = bool(success)
+        self._save()
+        return agreement
+
+    def finish_due_agreements(self, today) -> List[dict]:
+        """Complete active tracked agreements whose period has ended."""
+        done = []
+        for agreement in self.state.get("agreements", []):
+            if agreement.get("status") != "active":
+                continue
+            until = (agreement.get("checkin") or {}).get("until")
+            if until and today.isoformat() > str(until):
+                agreement["status"] = "completed"
+                agreement["finished_at"] = datetime.now(timezone.utc).isoformat()
+                done.append(agreement)
+        if done:
+            self._save()
+        return done
+
+    def latest_checkin_agreement(self) -> Optional[dict]:
+        for agreement in reversed(self.state.get("agreements", [])):
+            if agreement.get("status") == "active" and agreement.get("checkin"):
+                return agreement
+        return None
+
     def latest_open_agreement(self) -> Optional[dict]:
         for agreement in reversed(self.state.get("agreements", [])):
             if agreement.get("status") == "pending":
@@ -402,8 +474,8 @@ class Ledger:
 
     def _update_agreement_status(self, agreement: dict) -> None:
         # An agreement binds its acceptors; it takes effect once at least two
-        # people are in. Revoked agreements never change status again.
-        if agreement.get("status") in ("revoked", "cancelled"):
+        # people are in. Revoked/completed agreements never change status again.
+        if agreement.get("status") in ("revoked", "cancelled", "completed"):
             return
         accepted = {int(uid) for uid in agreement.get("accepted_by", [])}
         agreement["status"] = "active" if len(accepted) >= 2 else "pending"
@@ -701,8 +773,14 @@ AMOUNT_PATTERN = re.compile(
 )
 SETTLEMENT_PATTERN = re.compile(r"^\s*(.*)$")
 PUSHUPS_PATTERN = re.compile(r"^\s*(\d+)\s*(?:push[-\s]?ups?)?\s*$", re.IGNORECASE)
-CHALLENGE_UNTIL_PATTERN = re.compile(r"\s+until\s+(\d{4}-\d{2}-\d{2})\s*$", re.IGNORECASE)
-CHALLENGE_FOR_PATTERN = re.compile(r"\s+for\s+(\d+)\s*(d|days?|w|weeks?)\s*$", re.IGNORECASE)
+UNTIL_DATE_PATTERN = re.compile(r"\s+until\s+(\d{4}-\d{2}-\d{2})\s*$", re.IGNORECASE)
+FOR_DURATION_PATTERN = re.compile(
+    r"\s+for\s+(\d+)\s*(d|days?|w|weeks?|m|months?|y|years?)\s*$", re.IGNORECASE
+)
+AGREE_SCHEDULE_PATTERN = re.compile(
+    r"(?:^|\s)(every\s?day|daily|every\s+weekday|weekdays|every\s+weekend|weekends)\s*$",
+    re.IGNORECASE,
+)
 CHALLENGE_TARGET_PATTERN = re.compile(r"^(\d+)\s+(.+)$")
 SCORE_AMOUNT_PATTERN = re.compile(r"^[+-]?\d+$")
 
@@ -761,10 +839,46 @@ def parse_pushups_text(text: str) -> int:
 
 
 CHALLENGE_USAGE = "Use: /challenge [target] <title> [for 7d | until YYYY-MM-DD]"
+AGREE_USAGE = "Use: /agree <text> [daily|weekdays|weekends] [for 1y | until YYYY-MM-DD]"
+
+
+def duration_to_days(count: int, unit: str) -> int:
+    unit = unit.lower()
+    if unit.startswith("w"):
+        return count * 7
+    if unit.startswith("m"):
+        return count * 30
+    if unit.startswith("y"):
+        return count * 365
+    return count
+
+
+def strip_period_suffix(text: str, today) -> Tuple[str, Optional[str]]:
+    """Strip a trailing 'until YYYY-MM-DD' or 'for N d/w/m/y' from text.
+
+    Returns (remaining_text, end_date_iso or None). The end date is inclusive.
+    """
+    match = UNTIL_DATE_PATTERN.search(text)
+    if match:
+        try:
+            end_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("The date must be valid, like 2026-07-20.") from exc
+        if end_date < today:
+            raise ValueError("That end date is already in the past.")
+        return text[: match.start()].strip(), end_date.isoformat()
+    match = FOR_DURATION_PATTERN.search(text)
+    if match:
+        count = int(match.group(1))
+        if count <= 0:
+            raise ValueError("Duration must be positive.")
+        days = duration_to_days(count, match.group(2))
+        return text[: match.start()].strip(), (today + timedelta(days=days)).isoformat()
+    return text, None
 
 
 def parse_challenge_text(text: str, today) -> Tuple[Optional[int], str, Optional[str]]:
-    """Parse '/challenge [target] <title> [for Nd|Nw | until YYYY-MM-DD]'.
+    """Parse '/challenge [target] <title> [for Nd|Nw|Nm|Ny | until YYYY-MM-DD]'.
 
     Returns (target, title, deadline_iso). The deadline is the last day
     scoring is allowed (inclusive).
@@ -773,26 +887,7 @@ def parse_challenge_text(text: str, today) -> Tuple[Optional[int], str, Optional
     if not text:
         raise ValueError(CHALLENGE_USAGE)
 
-    deadline: Optional[str] = None
-    match = CHALLENGE_UNTIL_PATTERN.search(text)
-    if match:
-        try:
-            deadline_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-        except ValueError as exc:
-            raise ValueError("Deadline must be a valid date like 2026-07-20.") from exc
-        if deadline_date < today:
-            raise ValueError("That deadline is already in the past.")
-        deadline = deadline_date.isoformat()
-        text = text[: match.start()].strip()
-    else:
-        match = CHALLENGE_FOR_PATTERN.search(text)
-        if match:
-            count = int(match.group(1))
-            if count <= 0:
-                raise ValueError("Duration must be positive.")
-            days = count * 7 if match.group(2).lower().startswith("w") else count
-            deadline = (today + timedelta(days=days)).isoformat()
-            text = text[: match.start()].strip()
+    text, deadline = strip_period_suffix(text, today)
 
     target: Optional[int] = None
     match = CHALLENGE_TARGET_PATTERN.match(text)
@@ -802,6 +897,78 @@ def parse_challenge_text(text: str, today) -> Tuple[Optional[int], str, Optional
     if not text or text.isdigit():
         raise ValueError(CHALLENGE_USAGE)
     return target, text, deadline
+
+
+def parse_agreement_text(text: str, today) -> Tuple[str, Optional[dict]]:
+    """Parse '/agree <text> [daily|weekdays|weekends] [for 1y | until DATE]'.
+
+    A trailing schedule and/or period turns the agreement into a tracked one:
+    the bot asks for a daily check-in on scheduled days and keeps per-person
+    success stats. A period without a schedule implies daily check-ins.
+    Returns (text, checkin_dict or None).
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError(AGREE_USAGE)
+
+    text, until = strip_period_suffix(text, today)
+
+    days: Optional[str] = None
+    match = AGREE_SCHEDULE_PATTERN.search(text)
+    if match:
+        word = match.group(1).lower()
+        if "weekday" in word:
+            days = "weekdays"
+        elif "weekend" in word:
+            days = "weekends"
+        else:
+            days = "daily"
+        text = text[: match.start()].strip()
+
+    if not text:
+        raise ValueError(AGREE_USAGE)
+    if days is None and until is None:
+        return text, None
+    return text, {"days": days or "daily", "until": until, "log": {}}
+
+
+def is_scheduled_day(kind: str, day) -> bool:
+    weekday = day.weekday()  # 0=Mon .. 6=Sun
+    if kind == "weekdays":
+        return weekday < 5
+    if kind == "weekends":
+        return weekday >= 5
+    return True
+
+
+def checkin_stats(agreement: dict, user_id: int) -> Tuple[int, int]:
+    """Returns (yes_count, no_count) for a user's check-in log."""
+    log = (agreement.get("checkin") or {}).get("log", {}).get(str(user_id), {})
+    yes = sum(1 for value in log.values() if value)
+    return yes, len(log) - yes
+
+
+def checkin_streak(agreement: dict, user_id: int, today) -> int:
+    """Consecutive scheduled days answered 'yes', counting back from today.
+    Today doesn't break the streak while still unanswered; a skipped or
+    missed scheduled day before that does."""
+    checkin = agreement.get("checkin") or {}
+    kind = checkin.get("days", "daily")
+    log = checkin.get("log", {}).get(str(user_id), {})
+    day = today
+    if not is_scheduled_day(kind, day) or log.get(day.isoformat()) is None:
+        day -= timedelta(days=1)
+    streak = 0
+    for _ in range(4000):  # hard bound; ~11 years of days
+        if not is_scheduled_day(kind, day):
+            day -= timedelta(days=1)
+            continue
+        if log.get(day.isoformat()):
+            streak += 1
+            day -= timedelta(days=1)
+        else:
+            break
+    return streak
 
 
 def challenge_expired(challenge: dict, today) -> bool:
@@ -965,7 +1132,19 @@ def progress_bar(value: int, target: int, width: int = 10) -> str:
     return "▰" * filled + "▱" * (width - filled) + f" {int(ratio * 100)}%"
 
 
-def format_agreement(agreement: dict, config: BotConfig) -> str:
+def checkin_user_line(
+    agreement: dict, user_id: int, participants: Dict[str, Any], config: BotConfig, today
+) -> str:
+    yes, no = checkin_stats(agreement, user_id)
+    streak = checkin_streak(agreement, user_id, today)
+    line = f"{display_name(user_id, participants, config)}: {yes}✅ {no}❌"
+    if streak >= 2:
+        line += f" 🔥{streak}d"
+    return line
+
+
+def format_agreement(agreement: dict, config: BotConfig, today=None) -> str:
+    today = today or datetime.now(timezone.utc).date()
     participants = agreement.get("participants", {}) or {}
     accepted = [int(uid) for uid in agreement.get("accepted_by", [])]
     declined = [int(uid) for uid in agreement.get("declined_by", [])]
@@ -973,6 +1152,26 @@ def format_agreement(agreement: dict, config: BotConfig) -> str:
     icon = STATUS_ICONS.get(status, "")
     lines = [f"📜 {agreement.get('id')} — {agreement.get('text')}"]
     lines.append(f"Status: {icon} {status}".rstrip())
+    checkin = agreement.get("checkin")
+    if checkin:
+        kind = checkin.get("days", "daily")
+        until = checkin.get("until")
+        line = f"📅 Check-in {kind}"
+        if until:
+            if status == "active":
+                try:
+                    days_left = (
+                        datetime.strptime(str(until), "%Y-%m-%d").date() - today
+                    ).days
+                    line += f" until {until} ({days_left}d left)"
+                except ValueError:
+                    line += f" until {until}"
+            else:
+                line += f" until {until}"
+        lines.append(line)
+        if status in ("active", "completed"):
+            for uid in accepted:
+                lines.append("   " + checkin_user_line(agreement, uid, participants, config, today))
     if accepted:
         lines.append("✅ " + ", ".join(display_name(uid, participants, config) for uid in accepted))
     else:
@@ -1004,6 +1203,18 @@ def format_agreement(agreement: dict, config: BotConfig) -> str:
         if note:
             latest += f" — “{note}”"
         lines.append(latest)
+    return "\n".join(lines)
+
+
+def format_checkin_day(agreement: dict, config: BotConfig, day_iso: str, today) -> str:
+    checkin = agreement.get("checkin") or {}
+    participants = agreement.get("participants", {}) or {}
+    log = checkin.get("log", {})
+    lines = [f"📅 Check-in {day_iso} — {agreement.get('text')}"]
+    for uid in [int(u) for u in agreement.get("accepted_by", [])]:
+        value = log.get(str(uid), {}).get(day_iso)
+        mark = "…" if value is None else ("✅" if value else "❌")
+        lines.append(f"{mark} " + checkin_user_line(agreement, uid, participants, config, today))
     return "\n".join(lines)
 
 
@@ -1198,6 +1409,21 @@ def agreement_keyboard(instance_id: str, agreement_id: str) -> InlineKeyboardMar
     )
 
 
+def checkin_keyboard(instance_id: str, agreement_id: str, day_iso: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Made it", callback_data=f"chk|y|{instance_id}|{agreement_id}|{day_iso}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Missed", callback_data=f"chk|n|{instance_id}|{agreement_id}|{day_iso}"
+                ),
+            ]
+        ]
+    )
+
+
 def challenge_keyboard(instance_id: str, challenge_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -1304,9 +1530,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- /join / /leave  (opt in/out of expense splitting in this group)\n\n"
         "Agreements 🤝:\n"
         "- /agree <text>  (propose; active once two people accept)\n"
+        "- /agree <text> [daily|weekdays|weekends] [for 1y]  (adds a daily check-in)\n"
+        "- /checkin [id] [yes|no]  (answer today's check-in; I also ask daily at 18:00 UTC)\n"
         "- /accept [id], /decline [id], /revoke <id>\n"
         "- /breach [id] [name] [note]  (record a broken agreement — reply to someone to blame them)\n"
-        "- /agreements [all|active|pending]\n\n"
+        "- /agreements [all|active|pending|done]\n\n"
         "Challenges 🏆:\n"
         "- /challenge [target] <title> [for 7d | until YYYY-MM-DD]\n"
         "- /score [id] <amount>  (negative corrects mistakes)\n"
@@ -1515,6 +1743,9 @@ def build_agreement_list(ledger: Ledger, config: BotConfig, which: str) -> str:
         selected = agreements
     elif which in ("active", "pending"):
         selected = [a for a in agreements if a.get("status") == which]
+    elif which in ("done", "completed", "finished"):
+        which = "done"
+        selected = [a for a in agreements if a.get("status") == "completed"]
     else:
         which = "open"
         selected = [a for a in agreements if a.get("status") in ("pending", "active")]
@@ -1563,16 +1794,21 @@ async def agree_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not actor:
         await update.message.reply_text(PARTICIPANT_GATE_TEXT)
         return
-    text = " ".join(context.args)
+    today = datetime.now(timezone.utc).date()
     try:
-        agreement = ledger.create_agreement(actor, text)
+        text, checkin = parse_agreement_text(" ".join(context.args), today)
+        agreement = ledger.create_agreement(actor, text, checkin)
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
+    extra = ""
+    if checkin:
+        extra = "\nI'll ask for a daily check-in on scheduled days (or use /checkin yes|no)."
     await update.message.reply_text(
         f"Agreement proposed by {actor.name}.\n\n"
-        f"{format_agreement(agreement, config)}\n\n"
-        "Tap a button or use /accept, /decline. It takes effect once two people are in.",
+        f"{format_agreement(agreement, config, today)}\n\n"
+        "Tap a button or use /accept, /decline. It takes effect once two people are in."
+        + extra,
         reply_markup=agreement_keyboard(config.instance_id, str(agreement["id"])),
     )
 
@@ -1710,6 +1946,92 @@ async def agreements_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ledger, config = get_runtime_for_update(update, context)
     which = context.args[0].lower() if context.args else "open"
     await update.message.reply_text(build_agreement_list(ledger, config, which))
+
+
+CHECKIN_YES_WORDS = {"yes", "y", "done", "made", "madeit", "success", "held"}
+CHECKIN_NO_WORDS = {"no", "n", "miss", "missed", "fail", "failed", "broke"}
+
+
+async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = resolve_participant(user, config)
+    if not actor:
+        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        return
+    args = list(context.args or [])
+    agreement = None
+    if args:
+        agreement = ledger.find_agreement(args[0])
+        if agreement:
+            args.pop(0)
+    if not agreement:
+        agreement = ledger.latest_checkin_agreement()
+    if not agreement or not agreement.get("checkin"):
+        await update.message.reply_text(
+            "No active agreement with a daily check-in. Create one like:\n"
+            "/agree meet at 8:30 every day for 1y"
+        )
+        return
+    today = datetime.now(timezone.utc).date()
+    day_iso = today.isoformat()
+    if not args:
+        await update.message.reply_text(
+            format_checkin_day(agreement, config, day_iso, today),
+            reply_markup=checkin_keyboard(config.instance_id, str(agreement["id"]), day_iso),
+        )
+        return
+    answer = args[0].lower()
+    if answer in CHECKIN_YES_WORDS:
+        success = True
+    elif answer in CHECKIN_NO_WORDS:
+        success = False
+    else:
+        await update.message.reply_text("Use: /checkin [agreement_id] yes|no")
+        return
+    try:
+        agreement = ledger.record_checkin(str(agreement["id"]), actor, day_iso, success)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await update.message.reply_text(format_checkin_day(agreement, config, day_iso, today))
+
+
+async def checkin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    parts = (query.data or "").split("|")
+    if len(parts) != 5:
+        await query.answer()
+        return
+    _, answer, instance_id, agreement_id, day_iso = parts
+    runtime = runtime_for_instance(context, instance_id)
+    if not runtime:
+        await query.answer("This instance no longer exists.", show_alert=True)
+        return
+    ledger, config = runtime
+    actor = resolve_participant(query.from_user, config)
+    if not actor:
+        await query.answer(PARTICIPANT_GATE_TEXT, show_alert=True)
+        return
+    try:
+        agreement = ledger.record_checkin(agreement_id, actor, day_iso, answer == "y")
+    except ValueError as exc:
+        await query.answer(str(exc), show_alert=True)
+        return
+    await query.answer("Recorded ✅" if answer == "y" else "Recorded ❌")
+    today = datetime.now(timezone.utc).date()
+    text = format_checkin_day(agreement, config, day_iso, today)
+    try:
+        # Keep the buttons so others (or a change of heart) can still answer.
+        await query.edit_message_text(
+            text, reply_markup=checkin_keyboard(instance_id, agreement_id, day_iso)
+        )
+    except Exception:
+        pass  # message unchanged (same answer tapped twice) or no longer editable
 
 
 async def challenge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2309,6 +2631,47 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def agreement_checkin_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask the daily 'did you hold it?' question for tracked agreements and
+    close out agreements whose period has ended."""
+    store: InstanceStore = context.application.bot_data["store"]
+    base_config: BotConfig = context.application.bot_data["base_config"]
+    today = datetime.now(timezone.utc).date()
+    day_iso = today.isoformat()
+    for instance_id in store.all_instance_ids():
+        ledger = store.ledger_for(instance_id)
+        config = store.config_for(base_config, instance_id)
+        instance = store.state.get("instances", {}).get(instance_id) or {}
+        chat_id = instance.get("chat_id")
+        recipients = [chat_id] if chat_id else [u.id for u in config.users]
+
+        async def send_to_all(text: str, keyboard=None) -> None:
+            for recipient in recipients:
+                try:
+                    await context.bot.send_message(
+                        chat_id=recipient, text=text, reply_markup=keyboard
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to send check-in to %s: %s", recipient, exc)
+
+        for agreement in ledger.finish_due_agreements(today):
+            await send_to_all(
+                "🏁 Agreement period complete!\n\n"
+                + format_agreement(agreement, config, today)
+            )
+        for agreement in ledger.state.get("agreements", []):
+            if agreement.get("status") != "active":
+                continue
+            checkin = agreement.get("checkin")
+            if not checkin or not is_scheduled_day(checkin.get("days", "daily"), today):
+                continue
+            await send_to_all(
+                f"Did you hold it today?\n\n"
+                + format_checkin_day(agreement, config, day_iso, today),
+                keyboard=checkin_keyboard(instance_id, str(agreement["id"]), day_iso),
+            )
+
+
 async def challenge_deadline_sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Close challenges whose deadline passed and announce final standings."""
     store: InstanceStore = context.application.bot_data["store"]
@@ -2395,6 +2758,11 @@ def build_application(config: BotConfig, store: InstanceStore) -> Application:
             time=time(hour=0, minute=5, tzinfo=timezone.utc),
             name="challenge-deadline-sweep",
         )
+        application.job_queue.run_daily(
+            agreement_checkin_job,
+            time=time(hour=18, minute=0, tzinfo=timezone.utc),
+            name="agreement-checkin",
+        )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
@@ -2409,6 +2777,7 @@ def build_application(config: BotConfig, store: InstanceStore) -> Application:
     application.add_handler(CommandHandler("decline", decline_handler))
     application.add_handler(CommandHandler("revoke", revoke_handler))
     application.add_handler(CommandHandler("breach", breach_handler))
+    application.add_handler(CommandHandler("checkin", checkin_handler))
     application.add_handler(CommandHandler("agreements", agreements_handler))
     application.add_handler(CommandHandler("challenge", challenge_handler))
     application.add_handler(CommandHandler("score", score_handler))
@@ -2439,6 +2808,7 @@ def build_application(config: BotConfig, store: InstanceStore) -> Application:
     )
     application.add_handler(CallbackQueryHandler(agreement_callback, pattern=r"^agr\|"))
     application.add_handler(CallbackQueryHandler(challenge_callback, pattern=r"^chl\|"))
+    application.add_handler(CallbackQueryHandler(checkin_callback, pattern=r"^chk\|"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_text_handler))
     return application
 

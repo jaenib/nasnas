@@ -17,7 +17,11 @@ from bot import (  # noqa: E402
     UserConfig,
     challenge_expired,
     challenge_streak,
+    checkin_stats,
+    checkin_streak,
+    is_scheduled_day,
     next_item_id,
+    parse_agreement_text,
     parse_challenge_text,
 )
 
@@ -173,6 +177,149 @@ class ChallengeLifecycleTests(LedgerTestCase):
         self.assertEqual(challenge_streak(challenge, BOB.id, TODAY), 0)
 
 
+class AgreementCheckinTests(LedgerTestCase):
+    def _tracked_agreement(self, days="daily", until=None):
+        agreement = self.ledger.create_agreement(
+            ALICE, "meet 8:30 weekdays, 10:00 weekends",
+            {"days": days, "until": until, "log": {}},
+        )
+        self.ledger.respond_agreement(agreement["id"], BOB, accept=True)
+        return agreement
+
+    def test_checkin_records_per_day(self):
+        agreement = self._tracked_agreement()
+        agreement = self.ledger.record_checkin(agreement["id"], ALICE, TODAY.isoformat(), True)
+        agreement = self.ledger.record_checkin(agreement["id"], BOB, TODAY.isoformat(), False)
+        log = agreement["checkin"]["log"]
+        self.assertTrue(log[str(ALICE.id)][TODAY.isoformat()])
+        self.assertFalse(log[str(BOB.id)][TODAY.isoformat()])
+        self.assertEqual(checkin_stats(agreement, ALICE.id), (1, 0))
+        self.assertEqual(checkin_stats(agreement, BOB.id), (0, 1))
+
+    def test_checkin_answer_can_be_changed(self):
+        agreement = self._tracked_agreement()
+        self.ledger.record_checkin(agreement["id"], ALICE, TODAY.isoformat(), False)
+        agreement = self.ledger.record_checkin(agreement["id"], ALICE, TODAY.isoformat(), True)
+        self.assertEqual(checkin_stats(agreement, ALICE.id), (1, 0))
+
+    def test_checkin_rejects_future_and_unscheduled_days(self):
+        kind_not_today = "weekends" if TODAY.weekday() < 5 else "weekdays"
+        agreement = self._tracked_agreement(days=kind_not_today)
+        with self.assertRaises(ValueError):
+            self.ledger.record_checkin(agreement["id"], ALICE, TODAY.isoformat(), True)
+        daily = self._tracked_agreement()
+        tomorrow = (TODAY + timedelta(days=1)).isoformat()
+        with self.assertRaises(ValueError):
+            self.ledger.record_checkin(daily["id"], ALICE, tomorrow, True)
+
+    def test_checkin_requires_tracked_agreement(self):
+        agreement = self.ledger.create_agreement(ALICE, "plain pact")
+        self.ledger.respond_agreement(agreement["id"], BOB, accept=True)
+        with self.assertRaises(ValueError):
+            self.ledger.record_checkin(agreement["id"], ALICE, TODAY.isoformat(), True)
+
+    def test_checkin_auto_accepts_participant(self):
+        agreement = self.ledger.create_agreement(
+            ALICE, "morning runs", {"days": "daily", "until": None, "log": {}}
+        )
+        self.assertEqual(agreement["status"], "pending")
+        agreement = self.ledger.record_checkin(agreement["id"], CARO, TODAY.isoformat(), True)
+        self.assertEqual(agreement["status"], "active")
+        self.assertIn(CARO.id, agreement["accepted_by"])
+
+    def test_solo_checkin_needs_second_acceptor(self):
+        agreement = self.ledger.create_agreement(
+            ALICE, "morning runs", {"days": "daily", "until": None, "log": {}}
+        )
+        with self.assertRaises(ValueError):
+            self.ledger.record_checkin(agreement["id"], ALICE, TODAY.isoformat(), True)
+        self.assertEqual(agreement["status"], "pending")
+
+    def test_period_end_completes_agreement(self):
+        yesterday = (TODAY - timedelta(days=1)).isoformat()
+        agreement = self._tracked_agreement(until=yesterday)
+        done = self.ledger.finish_due_agreements(TODAY)
+        self.assertEqual([a["id"] for a in done], [agreement["id"]])
+        self.assertEqual(agreement["status"], "completed")
+        with self.assertRaises(ValueError):
+            self.ledger.record_checkin(agreement["id"], ALICE, yesterday, True)
+        with self.assertRaises(ValueError):
+            self.ledger.respond_agreement(agreement["id"], CARO, accept=True)
+
+    def test_checkin_streak_skips_unscheduled_days(self):
+        agreement = self._tracked_agreement(days="weekdays")
+        log = {}
+        day = TODAY - timedelta(days=1)
+        weekdays_marked = 0
+        while weekdays_marked < 6:  # six most recent weekdays, skipping weekends
+            if day.weekday() < 5:
+                log[day.isoformat()] = True
+                weekdays_marked += 1
+            day -= timedelta(days=1)
+        agreement["checkin"]["log"] = {str(ALICE.id): log}
+        self.assertEqual(checkin_streak(agreement, ALICE.id, TODAY), 6)
+        # A miss on the oldest marked day doesn't matter; one in the middle breaks it.
+        middle = sorted(log.keys())[2]
+        log[middle] = False
+        self.assertEqual(checkin_streak(agreement, ALICE.id, TODAY), 3)
+
+    def test_latest_checkin_agreement_found(self):
+        self.ledger.create_agreement(ALICE, "plain pact")
+        tracked = self._tracked_agreement()
+        self.assertEqual(self.ledger.latest_checkin_agreement()["id"], tracked["id"])
+
+
+class ParseAgreementTests(unittest.TestCase):
+    def test_plain_text_has_no_checkin(self):
+        self.assertEqual(parse_agreement_text("no phones at dinner", TODAY),
+                         ("no phones at dinner", None))
+
+    def test_schedule_and_duration(self):
+        text, checkin = parse_agreement_text(
+            "meet 8.30 weekdays and 10 weekends everyday for 1y", TODAY
+        )
+        self.assertEqual(text, "meet 8.30 weekdays and 10 weekends")
+        self.assertEqual(checkin["days"], "daily")
+        self.assertEqual(checkin["until"], (TODAY + timedelta(days=365)).isoformat())
+
+    def test_weekday_schedule_without_duration(self):
+        text, checkin = parse_agreement_text("gym before work weekdays", TODAY)
+        self.assertEqual(text, "gym before work")
+        self.assertEqual(checkin, {"days": "weekdays", "until": None, "log": {}})
+
+    def test_duration_alone_implies_daily(self):
+        text, checkin = parse_agreement_text("no sugar for 30d", TODAY)
+        self.assertEqual(text, "no sugar")
+        self.assertEqual(checkin["days"], "daily")
+        self.assertEqual(checkin["until"], (TODAY + timedelta(days=30)).isoformat())
+
+    def test_until_date(self):
+        future = (TODAY + timedelta(days=90)).isoformat()
+        _, checkin = parse_agreement_text(f"meditate daily until {future}", TODAY)
+        self.assertEqual(checkin["until"], future)
+
+    def test_past_until_rejected(self):
+        past = (TODAY - timedelta(days=1)).isoformat()
+        with self.assertRaises(ValueError):
+            parse_agreement_text(f"meditate daily until {past}", TODAY)
+
+    def test_empty_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_agreement_text("", TODAY)
+        with self.assertRaises(ValueError):
+            parse_agreement_text("daily for 7d", TODAY)  # schedule but no text
+
+    def test_is_scheduled_day(self):
+        monday = TODAY - timedelta(days=TODAY.weekday())
+        saturday = monday + timedelta(days=5)
+        self.assertTrue(is_scheduled_day("daily", monday))
+        self.assertTrue(is_scheduled_day("daily", saturday))
+        self.assertTrue(is_scheduled_day("weekdays", monday))
+        self.assertFalse(is_scheduled_day("weekdays", saturday))
+        self.assertFalse(is_scheduled_day("weekends", monday))
+        self.assertTrue(is_scheduled_day("weekends", saturday))
+
+
 class ParseChallengeTests(unittest.TestCase):
     def test_plain_title(self):
         self.assertEqual(parse_challenge_text("read books", TODAY), (None, "read books", None))
@@ -185,6 +332,12 @@ class ParseChallengeTests(unittest.TestCase):
     def test_duration_weeks(self):
         _, _, deadline = parse_challenge_text("climb for 2 weeks", TODAY)
         self.assertEqual(deadline, (TODAY + timedelta(days=14)).isoformat())
+
+    def test_duration_months_and_years(self):
+        _, _, deadline = parse_challenge_text("run for 3m", TODAY)
+        self.assertEqual(deadline, (TODAY + timedelta(days=90)).isoformat())
+        _, _, deadline = parse_challenge_text("meet at 8:30 for 1y", TODAY)
+        self.assertEqual(deadline, (TODAY + timedelta(days=365)).isoformat())
 
     def test_until_date(self):
         future = (TODAY + timedelta(days=10)).isoformat()

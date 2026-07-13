@@ -40,10 +40,24 @@ An agreement binds the people who accept it, and takes effect once **two** peopl
 - `/accept [id]` / `/decline [id]` — respond to the latest open agreement, or a specific one. Accepting an active agreement joins it; declining one you accepted leaves it (below two acceptors it goes back to pending).
 - `/revoke <id>` — creator withdraws the agreement for everyone.
 - `/breach [id] [name] [note]` — record a broken agreement. Reply to someone's message to blame them, name them (`/breach a2 Bob skipped again`), or omit the name to own up yourself. Strike counts show on the agreement.
-- `/agreements [all|active|pending]` — list agreements (default: open ones).
+- `/agreements [all|active|pending|done]` — list agreements (default: open ones).
+
+### Daily check-ins (tracked agreements)
+Add a schedule and/or period to `/agree` and the bot keeps score of compliance:
+```
+/agree meet 8.30 weekdays and 10 weekends every day for 1y
+/agree gym before work weekdays
+/agree no sugar for 30d          # a period alone implies daily
+/agree meditate daily until 2026-12-31
+```
+- Schedules: `daily` / `every day`, `weekdays`, `weekends`. Periods: `for Nd/Nw/Nm/Ny` or `until YYYY-MM-DD` (m = 30 days, y = 365 days).
+- On every scheduled day at 18:00 UTC the bot asks "Did you hold it today?" with **✅ Made it / ❌ Missed** buttons (sent to the group chat, or to both DMs for the default instance). Answers can be changed; `/checkin [id] yes|no` works too, and `/checkin` alone shows today's card.
+- Tracking per person: ✅/❌ totals and 🔥 streaks (streaks skip non-scheduled days, so a weekday agreement survives the weekend).
+- Checking in on an agreement you haven't accepted counts as accepting it.
+- When the period ends, the agreement completes with a final report (also swept daily). `/breach` stays available for disputes beyond the daily question.
 
 ## Challenges 🏆
-- `/challenge [target] <title> [for 7d | for 2w | until YYYY-MM-DD]` — start a challenge, e.g. `/challenge 100 push-ups for 7d`.
+- `/challenge [target] <title> [for 7d | for 2w | for 1y | until YYYY-MM-DD]` — start a challenge, e.g. `/challenge 100 push-ups for 7d`.
 - Every challenge message has `+1 / +5 / +10` buttons that update the leaderboard in place, plus 📊 Standings and 🏁 End (creator only).
 - `/score [id] <amount>` — log progress; negative amounts correct mistakes (totals never go below zero).
 - First to reach the target wins on the spot 🎉. Deadline challenges close automatically (checked daily at 00:05 UTC and on access) and the top scorer takes it.
