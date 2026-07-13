@@ -10,3 +10,5 @@ __pycache__/
 .env
 data/*.json.bak
 data/expenses.json
+deploy/*credentials*.txt
+deploy/ssh_*.sh

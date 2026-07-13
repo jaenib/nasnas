@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -38,6 +38,8 @@ load_dotenv()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +60,8 @@ class BotConfig:
     base_currency: str
     rates_to_base: Dict[str, float]
     healthcheck_chat_id: Optional[int] = None
+    instance_id: str = "default"
+    instance_name: str = "Default"
 
 
 def _env_int(key: str) -> int:
@@ -112,32 +116,57 @@ def load_config() -> BotConfig:
 # ----------------------------- persistence ------------------------------ #
 
 
+def empty_ledger_state() -> Dict[str, Any]:
+    return {
+        "expenses": [],
+        "settlements": [],
+        "pushups": {},
+        "agreements": [],
+        "challenges": [],
+    }
+
+
 class Ledger:
-    def __init__(self, path: Path, users: List[UserConfig]):
+    def __init__(
+        self,
+        path: Path,
+        users: List[UserConfig],
+        state: Optional[Dict[str, Any]] = None,
+        save_callback: Optional[Callable[[], None]] = None,
+    ):
         self.path = path
         self.users = {user.id: user for user in users}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.state: Dict[str, Any] = {"expenses": [], "settlements": [], "pushups": {}}
-        self._load()
+        self._save_callback = save_callback
+        if state is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.state = empty_ledger_state()
+            self._load()
+        else:
+            self.state = state
+            self._ensure_shape()
+
+    def _ensure_shape(self) -> None:
+        defaults = empty_ledger_state()
+        for key, value in defaults.items():
+            if key not in self.state:
+                self.state[key] = value.copy() if isinstance(value, dict) else list(value)
 
     def _load(self) -> None:
         if not self.path.exists():
-            self.state = {"expenses": [], "settlements": [], "pushups": {}}
+            self.state = empty_ledger_state()
             return
         try:
             with self.path.open("r", encoding="utf-8") as f:
                 self.state = json.load(f)
-            if "expenses" not in self.state:
-                self.state["expenses"] = []
-            if "settlements" not in self.state:
-                self.state["settlements"] = []
-            if "pushups" not in self.state:
-                self.state["pushups"] = {}
+            self._ensure_shape()
         except (json.JSONDecodeError, OSError) as exc:
             logger.error("Failed to load ledger from %s: %s", self.path, exc)
-            self.state = {"expenses": [], "settlements": [], "pushups": {}}
+            self.state = empty_ledger_state()
 
     def _save(self) -> None:
+        if self._save_callback:
+            self._save_callback()
+            return
         tmp_path = self.path.with_suffix(".tmp")
         with tmp_path.open("w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2)
@@ -263,6 +292,261 @@ class Ledger:
             enriched.append(copy)
         return sorted(enriched, key=lambda e: e.get("created_at", ""))[-limit:]
 
+    def create_agreement(self, creator: UserConfig, text: str) -> dict:
+        text = text.strip()
+        if not text:
+            raise ValueError("Use: /agree <agreement text>")
+        agreements = self.state.setdefault("agreements", [])
+        agreement = {
+            "id": next_item_id(agreements, "a"),
+            "text": text,
+            "creator_id": creator.id,
+            "creator_name": creator.name,
+            "accepted_by": [creator.id],
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        agreements.append(agreement)
+        self._update_agreement_status(agreement)
+        self._save()
+        return agreement
+
+    def accept_agreement(self, agreement_id: str, user: UserConfig) -> dict:
+        agreement = self.find_agreement(agreement_id)
+        if not agreement:
+            raise ValueError(f"Agreement {agreement_id} was not found.")
+        if agreement.get("status") == "cancelled":
+            raise ValueError(f"Agreement {agreement_id} is cancelled.")
+        accepted = agreement.setdefault("accepted_by", [])
+        if user.id not in accepted:
+            accepted.append(user.id)
+        self._update_agreement_status(agreement)
+        self._save()
+        return agreement
+
+    def latest_pending_agreement(self) -> Optional[dict]:
+        for agreement in reversed(self.state.get("agreements", [])):
+            if agreement.get("status") == "pending":
+                return agreement
+        return None
+
+    def find_agreement(self, agreement_id: str) -> Optional[dict]:
+        wanted = agreement_id.strip().lower()
+        for agreement in self.state.get("agreements", []):
+            if str(agreement.get("id", "")).lower() == wanted:
+                return agreement
+        return None
+
+    def _update_agreement_status(self, agreement: dict) -> None:
+        participant_ids = set(self.users)
+        accepted = {int(uid) for uid in agreement.get("accepted_by", [])}
+        agreement["status"] = "active" if participant_ids and participant_ids <= accepted else "pending"
+
+    def create_challenge(self, creator: UserConfig, title: str, target: Optional[int]) -> dict:
+        title = title.strip()
+        if not title:
+            raise ValueError("Use: /challenge [target] <title>")
+        challenges = self.state.setdefault("challenges", [])
+        challenge = {
+            "id": next_item_id(challenges, "c"),
+            "title": title,
+            "target": target,
+            "creator_id": creator.id,
+            "creator_name": creator.name,
+            "scores": {},
+            "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        challenges.append(challenge)
+        self._save()
+        return challenge
+
+    def add_challenge_score(self, challenge_id: str, user: UserConfig, amount: int) -> dict:
+        if amount <= 0:
+            raise ValueError("Score must be positive.")
+        challenge = self.find_challenge(challenge_id)
+        if not challenge:
+            raise ValueError(f"Challenge {challenge_id} was not found.")
+        if challenge.get("status") != "active":
+            raise ValueError(f"Challenge {challenge_id} is not active.")
+        scores = challenge.setdefault("scores", {})
+        user_key = str(user.id)
+        scores[user_key] = int(scores.get(user_key, 0)) + amount
+        self._save()
+        return challenge
+
+    def latest_active_challenge(self) -> Optional[dict]:
+        for challenge in reversed(self.state.get("challenges", [])):
+            if challenge.get("status") == "active":
+                return challenge
+        return None
+
+    def find_challenge(self, challenge_id: str) -> Optional[dict]:
+        wanted = challenge_id.strip().lower()
+        for challenge in self.state.get("challenges", []):
+            if str(challenge.get("id", "")).lower() == wanted:
+                return challenge
+        return None
+
+
+class InstanceStore:
+    def __init__(self, path: Path, default_users: List[UserConfig]):
+        self.path = path
+        self.default_users = default_users
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.state: Dict[str, Any] = {
+            "schema_version": 2,
+            "default_instance_id": "default",
+            "instances": {},
+        }
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self._ensure_default_instance(empty_ledger_state())
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error("Failed to load instance store from %s: %s", self.path, exc)
+            self._ensure_default_instance(empty_ledger_state())
+            return
+
+        if isinstance(raw, dict) and isinstance(raw.get("instances"), dict):
+            self.state = raw
+        else:
+            legacy = raw if isinstance(raw, dict) else empty_ledger_state()
+            self.state = {
+                "schema_version": 2,
+                "default_instance_id": "default",
+                "instances": {},
+            }
+            self._ensure_default_instance(legacy)
+
+        self.state.setdefault("schema_version", 2)
+        self.state.setdefault("default_instance_id", "default")
+        self.state.setdefault("instances", {})
+        self._ensure_default_instance()
+
+    def _save(self) -> None:
+        tmp_path = self.path.with_suffix(".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(self.state, f, indent=2)
+        tmp_path.replace(self.path)
+
+    def _ensure_default_instance(self, ledger_state: Optional[Dict[str, Any]] = None) -> None:
+        self.ensure_instance(
+            "default",
+            "Default",
+            chat_id=None,
+            users=self.default_users,
+            ledger_state=ledger_state,
+            save=False,
+        )
+
+    def ensure_instance(
+        self,
+        instance_id: str,
+        name: str,
+        chat_id: Optional[int],
+        users: Optional[List[UserConfig]] = None,
+        ledger_state: Optional[Dict[str, Any]] = None,
+        save: bool = True,
+    ) -> Dict[str, Any]:
+        instances = self.state.setdefault("instances", {})
+        instance = instances.get(instance_id)
+        if instance is None:
+            instance = ledger_state or empty_ledger_state()
+            instance["id"] = instance_id
+            instance["name"] = name
+            instance["chat_id"] = chat_id
+            instance["members"] = [
+                {"id": user.id, "name": user.name} for user in (users or [])
+            ]
+            instances[instance_id] = instance
+        else:
+            instance.setdefault("id", instance_id)
+            instance.setdefault("name", name)
+            instance.setdefault("chat_id", chat_id)
+            instance.setdefault("members", [])
+            if users and not instance["members"]:
+                instance["members"] = [
+                    {"id": user.id, "name": user.name} for user in users
+                ]
+        for key, value in empty_ledger_state().items():
+            if key not in instance:
+                instance[key] = value.copy() if isinstance(value, dict) else list(value)
+        if save:
+            self._save()
+        return instance
+
+    def instance_id_for_update(self, update: Any, context: ContextTypes.DEFAULT_TYPE) -> str:
+        chat = getattr(update, "effective_chat", None)
+        if chat is None and getattr(update, "message", None):
+            chat = update.message.chat
+        if chat and chat.type != "private":
+            instance_id = f"chat:{chat.id}"
+            self.ensure_instance(instance_id, chat.title or str(chat.id), chat.id)
+            return instance_id
+        return context.user_data.get("active_instance_id", self.state["default_instance_id"])
+
+    def add_member(self, instance_id: str, user_id: int, name: str) -> None:
+        instance = self.state["instances"][instance_id]
+        members = instance.setdefault("members", [])
+        for member in members:
+            if int(member["id"]) == user_id:
+                member["name"] = name
+                self._save()
+                return
+        members.append({"id": user_id, "name": name})
+        self._save()
+
+    def remove_member(self, instance_id: str, user_id: int) -> None:
+        instance = self.state["instances"][instance_id]
+        members = instance.setdefault("members", [])
+        instance["members"] = [m for m in members if int(m["id"]) != user_id]
+        self._save()
+
+    def users_for(self, instance_id: str) -> List[UserConfig]:
+        instance = self.state["instances"][instance_id]
+        users = []
+        for member in instance.get("members", []):
+            try:
+                users.append(UserConfig(id=int(member["id"]), name=str(member["name"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return users
+
+    def ledger_for(self, instance_id: str) -> Ledger:
+        instance = self.state["instances"][instance_id]
+        return Ledger(self.path, self.users_for(instance_id), state=instance, save_callback=self._save)
+
+    def config_for(self, base_config: BotConfig, instance_id: str) -> BotConfig:
+        instance = self.state["instances"][instance_id]
+        return BotConfig(
+            token=base_config.token,
+            users=self.users_for(instance_id),
+            data_path=base_config.data_path,
+            base_currency=base_config.base_currency,
+            rates_to_base=base_config.rates_to_base,
+            healthcheck_chat_id=base_config.healthcheck_chat_id,
+            instance_id=instance_id,
+            instance_name=str(instance.get("name") or instance_id),
+        )
+
+    def user_instances(self, user_id: int) -> List[Dict[str, Any]]:
+        found = []
+        for instance in self.state.get("instances", {}).values():
+            for member in instance.get("members", []):
+                if int(member.get("id", 0)) == user_id:
+                    found.append(instance)
+                    break
+        return found
+
+    def all_instance_ids(self) -> List[str]:
+        return list(self.state.get("instances", {}).keys())
+
 
 # ------------------------------ utilities ------------------------------- #
 
@@ -272,6 +556,20 @@ AMOUNT_PATTERN = re.compile(
 )
 SETTLEMENT_PATTERN = re.compile(r"^\s*(.*)$")
 PUSHUPS_PATTERN = re.compile(r"^\s*(\d+)\s*(?:push[-\s]?ups?)?\s*$", re.IGNORECASE)
+CHALLENGE_PATTERN = re.compile(r"^\s*(?:(\d+)\s+)?(.+?)\s*$")
+
+
+def next_item_id(items: List[dict], prefix: str) -> str:
+    highest = 0
+    for item in items:
+        raw = str(item.get("id", ""))
+        if not raw.startswith(prefix):
+            continue
+        try:
+            highest = max(highest, int(raw[len(prefix) :]))
+        except ValueError:
+            continue
+    return f"{prefix}{highest + 1}"
 
 
 def normalize_currency(code: Optional[str]) -> str:
@@ -312,6 +610,15 @@ def parse_pushups_text(text: str) -> int:
     if count <= 0:
         raise ValueError("Count must be positive.")
     return count
+
+
+def parse_challenge_text(text: str) -> Tuple[Optional[int], str]:
+    match = CHALLENGE_PATTERN.match(text or "")
+    if not match:
+        raise ValueError("Use: /challenge [target] <title>")
+    target_raw, title = match.groups()
+    target = int(target_raw) if target_raw else None
+    return target, title.strip()
 
 
 def to_base(amount: float, currency: str, config: BotConfig) -> float:
@@ -421,11 +728,47 @@ def format_pushup_standings(
     return "\n".join(lines)
 
 
+def format_agreement(agreement: dict, config: BotConfig) -> str:
+    accepted = {int(uid) for uid in agreement.get("accepted_by", [])}
+    accepted_names = [
+        user.name for user in config.users if user.id in accepted
+    ] or ["Nobody yet"]
+    status = agreement.get("status", "pending")
+    return (
+        f"{agreement.get('id')}: {agreement.get('text')}\n"
+        f"Status: {status}. Accepted by: {', '.join(accepted_names)}"
+    )
+
+
+def format_challenge(challenge: dict, config: BotConfig) -> str:
+    scores = challenge.get("scores", {})
+    lines = [f"{challenge.get('id')}: {challenge.get('title')}"]
+    target = challenge.get("target")
+    if target:
+        lines[0] += f" (target {target})"
+    for user in sorted(config.users, key=lambda u: int(scores.get(str(u.id), 0)), reverse=True):
+        lines.append(f"- {user.name}: {int(scores.get(str(user.id), 0))}")
+    return "\n".join(lines)
+
+
 def get_runtime(context: ContextTypes.DEFAULT_TYPE) -> Tuple[Ledger, BotConfig]:
     return (
         context.application.bot_data["ledger"],
         context.application.bot_data["config"],
     )
+
+
+def get_runtime_for_update(
+    update: Any, context: ContextTypes.DEFAULT_TYPE
+) -> Tuple[Ledger, BotConfig]:
+    store: InstanceStore = context.application.bot_data["store"]
+    base_config: BotConfig = context.application.bot_data["base_config"]
+    instance_id = store.instance_id_for_update(update, context)
+    return store.ledger_for(instance_id), store.config_for(base_config, instance_id)
+
+
+def user_state_key(config: BotConfig, user_id: int, name: str) -> str:
+    return f"{name}:{config.instance_id}:{user_id}"
 
 
 def user_from_id(user_id: int, config: BotConfig) -> Optional[UserConfig]:
@@ -487,7 +830,7 @@ CB_PUSHUPS_ADD_PREFIX = f"{CB_PUSHUPS_PREFIX}add:"
 
 
 async def currency_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     query = update.callback_query
     if not query:
         return
@@ -496,7 +839,9 @@ async def currency_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not data.startswith(CB_CURRENCY_PREFIX):
         return
     currency = data[len(CB_CURRENCY_PREFIX) :].strip().upper()
-    pending = context.user_data.pop("pending_currency", None)
+    pending = context.user_data.pop(
+        user_state_key(config, query.from_user.id, "pending_currency"), None
+    )
     if not pending:
         await query.edit_message_text("No pending entry to apply this currency to.")
         return
@@ -534,8 +879,8 @@ async def currency_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, config = get_runtime(context)
-    names = " & ".join([u.name for u in config.users])
+    _, config = get_runtime_for_update(update, context)
+    names = " & ".join([u.name for u in config.users]) or "No participants yet"
     help_text = (
         "Shared travel bot is online.\n"
         "Add expenses by sending: `<amount> [CUR] <description>`\n"
@@ -547,6 +892,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- /balance\n"
         "- /history\n\n"
         "- /settle [comment]  (records who owed whom, marks it paid, and clears expenses)\n\n"
+        "- /join  (subscribe to this group instance)\n"
+        "- /agree <text> and /accept [id]\n"
+        "- /challenge [target] <title> and /score [id] <amount>\n\n"
+        f"Instance: {config.instance_name} (`{config.instance_id}`)\n"
         f"Participants: {names}\n"
         "Every entry is split evenly between both people.\n\n"
         "Use the inline menu below for quick actions."
@@ -555,7 +904,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def add_expense_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     user = update.effective_user
     if not user:
         return
@@ -564,7 +913,7 @@ async def add_expense_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("You're not on the traveler list for this bot.")
         return
 
-    text = " ".join(context.args) if context.args else (update.message.text or "")
+    text = " ".join(context.args) if context.args else ""
     try:
         amount, currency, description = parse_expense_text(text)
     except ValueError as exc:
@@ -572,11 +921,12 @@ async def add_expense_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if not currency:
-        context.user_data["pending_currency"] = {
+        context.user_data[user_state_key(config, actor.id, "pending_currency")] = {
             "kind": "expense",
             "amount": amount,
             "description": description,
             "payer_id": actor.id,
+            "instance_id": config.instance_id,
         }
         await update.message.reply_text(
             "Choose a currency:",
@@ -591,12 +941,14 @@ async def add_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Handle plain text messages (without commands) as expense inputs.
     if not update.message or not update.message.text:
         return
-    # Avoid responding to service messages in groups.
-    if update.message.chat.type != "private":
-        return
     text = update.message.text.strip()
-    if context.user_data.pop("awaiting_pushups_custom", False):
+    _, config = get_runtime_for_update(update, context)
+    user_id = update.effective_user.id if update.effective_user else 0
+    if context.user_data.pop(user_state_key(config, user_id, "awaiting_pushups_custom"), False):
         await pushups_text_handler(update, context)
+        return
+    # Avoid treating casual group text as bot input unless a command/button asked for it.
+    if update.message.chat.type != "private":
         return
     if PUSHUPS_PATTERN.match(text):
         await pushups_text_handler(update, context)
@@ -612,7 +964,7 @@ async def finalize_expense(
     currency: str,
     description: str,
 ) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     try:
         amount_base = to_base(amount, currency, config)
     except ValueError as exc:
@@ -642,14 +994,14 @@ async def finalize_expense(
 
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     net = ledger.balances()
     text = format_balance_lines(net, config.users, config.base_currency)
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
 async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     entries = ledger.last_entries(limit=10)
     if not entries:
         await update.message.reply_text("No expenses yet.", reply_markup=main_menu_keyboard())
@@ -658,6 +1010,197 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(
         "Recent activity:\n" + "\n".join(lines), reply_markup=main_menu_keyboard()
     )
+
+
+async def join_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    store: InstanceStore = context.application.bot_data["store"]
+    instance_id = store.instance_id_for_update(update, context)
+    if update.effective_chat and update.effective_chat.type == "private" and instance_id == "default":
+        _, config = get_runtime_for_update(update, context)
+        if not user_from_id(update.effective_user.id, config):
+            await update.message.reply_text("Use /join inside a group instance first.")
+            return
+    user = update.effective_user
+    name = user.full_name or user.username or str(user.id)
+    store.add_member(instance_id, user.id, name)
+    _, config = get_runtime_for_update(update, context)
+    await update.message.reply_text(
+        f"{name} joined {config.instance_name}. Participants: "
+        f"{', '.join([u.name for u in config.users])}",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def leave_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    store: InstanceStore = context.application.bot_data["store"]
+    instance_id = store.instance_id_for_update(update, context)
+    if instance_id == "default":
+        await update.message.reply_text("The default DM instance keeps its configured users.")
+        return
+    store.remove_member(instance_id, update.effective_user.id)
+    await update.message.reply_text("You left this instance.")
+
+
+async def instance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _, config = get_runtime_for_update(update, context)
+    names = ", ".join([u.name for u in config.users]) or "No participants yet"
+    await update.message.reply_text(
+        f"Instance: {config.instance_name}\nID: {config.instance_id}\nParticipants: {names}"
+    )
+
+
+async def instances_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    store: InstanceStore = context.application.bot_data["store"]
+    instances = store.user_instances(update.effective_user.id)
+    if not instances:
+        await update.message.reply_text("You are not subscribed to any instances yet.")
+        return
+    lines = ["Your instances:"]
+    for instance in instances:
+        lines.append(f"- {instance.get('name')} (`{instance.get('id')}`)")
+    lines.append("In a DM, use `/use <id>` to make one active.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def use_instance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("Group chats use their own group instance automatically.")
+        return
+    if not context.args:
+        await update.message.reply_text("Use: /use <instance_id>")
+        return
+    instance_id = context.args[0]
+    store: InstanceStore = context.application.bot_data["store"]
+    if instance_id not in store.state.get("instances", {}):
+        await update.message.reply_text(f"Instance {instance_id} was not found.")
+        return
+    if not any(i.get("id") == instance_id for i in store.user_instances(update.effective_user.id)):
+        await update.message.reply_text("You are not subscribed to that instance.")
+        return
+    context.user_data["active_instance_id"] = instance_id
+    _, config = get_runtime_for_update(update, context)
+    await update.message.reply_text(f"Active DM instance set to {config.instance_name}.")
+
+
+async def agree_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = user_from_id(user.id, config)
+    if not actor:
+        await update.message.reply_text("Join this instance first with /join.")
+        return
+    text = " ".join(context.args)
+    try:
+        agreement = ledger.create_agreement(actor, text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await update.message.reply_text(
+        f"Agreement proposed.\n{format_agreement(agreement, config)}\n"
+        f"Participants can accept with /accept {agreement['id']}."
+    )
+
+
+async def accept_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = user_from_id(user.id, config)
+    if not actor:
+        await update.message.reply_text("Join this instance first with /join.")
+        return
+    agreement_id = context.args[0] if context.args else None
+    agreement = ledger.find_agreement(agreement_id) if agreement_id else ledger.latest_pending_agreement()
+    if not agreement:
+        await update.message.reply_text("No pending agreement found.")
+        return
+    try:
+        agreement = ledger.accept_agreement(str(agreement["id"]), actor)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await update.message.reply_text(format_agreement(agreement, config))
+
+
+async def agreements_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    agreements = ledger.state.get("agreements", [])[-10:]
+    if not agreements:
+        await update.message.reply_text("No agreements yet.")
+        return
+    await update.message.reply_text("\n\n".join(format_agreement(a, config) for a in agreements))
+
+
+async def challenge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = user_from_id(user.id, config)
+    if not actor:
+        await update.message.reply_text("Join this instance first with /join.")
+        return
+    try:
+        target, title = parse_challenge_text(" ".join(context.args))
+        challenge = ledger.create_challenge(actor, title, target)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await update.message.reply_text(
+        f"Challenge created.\n{format_challenge(challenge, config)}\n"
+        f"Log progress with /score {challenge['id']} <amount>."
+    )
+
+
+async def score_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    actor = user_from_id(user.id, config)
+    if not actor:
+        await update.message.reply_text("Join this instance first with /join.")
+        return
+    if len(context.args) == 1:
+        challenge = ledger.latest_active_challenge()
+        if not challenge:
+            await update.message.reply_text("No active challenge found.")
+            return
+        challenge_id = str(challenge["id"])
+        raw_amount = context.args[0]
+    elif len(context.args) >= 2:
+        challenge_id = context.args[0]
+        raw_amount = context.args[1]
+    else:
+        await update.message.reply_text("Use: /score [challenge_id] <amount>")
+        return
+    try:
+        amount = int(raw_amount)
+        challenge = ledger.add_challenge_score(challenge_id, actor, amount)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+    await update.message.reply_text(format_challenge(challenge, config))
+
+
+async def challenges_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ledger, config = get_runtime_for_update(update, context)
+    challenges = ledger.state.get("challenges", [])[-10:]
+    if not challenges:
+        await update.message.reply_text("No challenges yet.")
+        return
+    await update.message.reply_text("\n\n".join(format_challenge(c, config) for c in challenges))
 
 
 async def healthcheck(app: Application, config: BotConfig) -> None:
@@ -672,7 +1215,7 @@ async def healthcheck(app: Application, config: BotConfig) -> None:
 
 
 async def settle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     user = update.effective_user
     if not user:
         return
@@ -681,11 +1224,10 @@ async def settle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("You're not on the traveler list for this bot.")
         return
 
-    # Exactly two users; find the other
-    other = next((u for u in config.users if u.id != actor.id), None)
-    if not other:
-        await update.message.reply_text("Need exactly two users configured for settlement.")
+    if len(config.users) != 2:
+        await update.message.reply_text("Settlement reset currently needs exactly two subscribed users.")
         return
+    other = next((u for u in config.users if u.id != actor.id), None)
 
     # Compute balances before clearing
     net_before = ledger.balances()
@@ -740,7 +1282,7 @@ async def finalize_settlement(
     comment: str,
 ) -> None:
     # Deprecated path (kept for inline currency callback safety); now settlements are auto base currency
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     net_before = ledger.balances()
     try:
         amount_base = to_base(amount, currency, config)
@@ -772,7 +1314,7 @@ async def finalize_settlement(
 
 
 async def pushups_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     user = update.effective_user
     if not user or not update.message:
         return
@@ -800,7 +1342,7 @@ async def pushups_command_handler(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def pushups_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     user = update.effective_user
     if not user or not update.message:
         return
@@ -829,7 +1371,7 @@ async def pushups_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def pushups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     query = update.callback_query
     if not query:
         return
@@ -863,7 +1405,7 @@ async def pushups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 reply_markup=main_menu_keyboard(),
             )
     elif action == "custom":
-        context.user_data["awaiting_pushups_custom"] = True
+        context.user_data[user_state_key(config, actor.id, "awaiting_pushups_custom")] = True
         if query.message:
             await query.message.reply_text(
                 "Send the number of push-ups to log for today (e.g. 25).",
@@ -872,17 +1414,18 @@ async def pushups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def settle_via_menu(
-    query, context: ContextTypes.DEFAULT_TYPE, actor: UserConfig
+    update: Update, context: ContextTypes.DEFAULT_TYPE, actor: UserConfig
 ) -> None:
-    ledger, config = get_runtime(context)
-    other = next((u for u in config.users if u.id != actor.id), None)
-    if not other:
+    query = update.callback_query
+    ledger, config = get_runtime_for_update(update, context)
+    if len(config.users) != 2:
         if query.message:
             await query.message.reply_text(
-                "Need exactly two users configured for settlement.",
+                "Settlement reset currently needs exactly two subscribed users.",
                 reply_markup=main_menu_keyboard(),
             )
         return
+    other = next((u for u in config.users if u.id != actor.id), None)
 
     net_before = ledger.balances()
     if all(abs(v) < 0.01 for v in net_before.values()):
@@ -944,7 +1487,7 @@ async def send_pushups_standings(
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    ledger, config = get_runtime_for_update(update, context)
     query = update.callback_query
     if not query:
         return
@@ -982,7 +1525,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     reply_markup=main_menu_keyboard(),
                 )
     elif action == "settle":
-        await settle_via_menu(query, context, actor)
+        await settle_via_menu(update, context, actor)
     elif action == "pushups":
         if query.message:
             await send_pushups_prompt(query.message, ledger, config)
@@ -1005,40 +1548,49 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def pushups_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
-    ledger, config = get_runtime(context)
+    store: InstanceStore = context.application.bot_data["store"]
+    base_config: BotConfig = context.application.bot_data["base_config"]
     day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
     day_key = day.isoformat()
-    totals = ledger.pushups_for_date(day_key)
-    standings = format_pushup_standings(totals, config, day_key)
-    recipients = [u.id for u in config.users]
-    if config.healthcheck_chat_id:
-        recipients.append(config.healthcheck_chat_id)
+    for instance_id in store.all_instance_ids():
+        ledger = store.ledger_for(instance_id)
+        config = store.config_for(base_config, instance_id)
+        totals = ledger.pushups_for_date(day_key)
+        if not totals:
+            continue
+        standings = format_pushup_standings(totals, config, day_key)
+        recipients = [u.id for u in config.users]
+        if config.healthcheck_chat_id and instance_id == "default":
+            recipients.append(config.healthcheck_chat_id)
 
-    for chat_id in recipients:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=standings)
-        except Exception as exc:
-            logger.warning("Failed to send daily push-up report to %s: %s", chat_id, exc)
+        for chat_id in recipients:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=standings)
+            except Exception as exc:
+                logger.warning("Failed to send daily push-up report to %s: %s", chat_id, exc)
 
 
 # ------------------------------ bootstrap -------------------------------- #
 
 
 async def on_startup(app: Application) -> None:
-    config: BotConfig = app.bot_data["config"]
+    config: BotConfig = app.bot_data["base_config"]
     await healthcheck(app, config)
-    logger.info("Bot started.")
+    store: InstanceStore = app.bot_data["store"]
+    logger.info("Bot started with %d instance(s).", len(store.all_instance_ids()))
 
 
-def build_application(config: BotConfig, ledger: Ledger) -> Application:
+def build_application(config: BotConfig, store: InstanceStore) -> Application:
     application = (
         Application.builder()
         .token(config.token)
         .post_init(on_startup)
         .build()
     )
-    application.bot_data["config"] = config
-    application.bot_data["ledger"] = ledger
+    application.bot_data["base_config"] = config
+    application.bot_data["store"] = store
+    application.bot_data["config"] = store.config_for(config, "default")
+    application.bot_data["ledger"] = store.ledger_for("default")
 
     application.job_queue.run_daily(
         pushups_daily_report,
@@ -1049,6 +1601,17 @@ def build_application(config: BotConfig, ledger: Ledger) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("join", join_handler))
+    application.add_handler(CommandHandler("leave", leave_handler))
+    application.add_handler(CommandHandler("instance", instance_handler))
+    application.add_handler(CommandHandler("instances", instances_handler))
+    application.add_handler(CommandHandler("use", use_instance_handler))
+    application.add_handler(CommandHandler("agree", agree_handler))
+    application.add_handler(CommandHandler("accept", accept_handler))
+    application.add_handler(CommandHandler("agreements", agreements_handler))
+    application.add_handler(CommandHandler("challenge", challenge_handler))
+    application.add_handler(CommandHandler("score", score_handler))
+    application.add_handler(CommandHandler("challenges", challenges_handler))
     application.add_handler(CommandHandler("add", add_expense_handler))
     application.add_handler(CommandHandler("balance", balance_handler))
     application.add_handler(CommandHandler("history", history_handler))
@@ -1078,8 +1641,8 @@ def build_application(config: BotConfig, ledger: Ledger) -> Application:
 
 def main() -> None:
     config = load_config()
-    ledger = Ledger(config.data_path, config.users)
-    application = build_application(config, ledger)
+    store = InstanceStore(config.data_path, config.users)
+    application = build_application(config, store)
     application.run_polling(stop_signals=None)
 
 
