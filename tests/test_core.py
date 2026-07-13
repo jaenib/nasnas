@@ -13,16 +13,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bot import (  # noqa: E402
+    BotConfig,
     InstanceStore,
     UserConfig,
     challenge_expired,
     challenge_streak,
     checkin_stats,
     checkin_streak,
+    format_agreement,
+    format_balance_lines,
+    format_challenge,
     is_scheduled_day,
     next_item_id,
     parse_agreement_text,
     parse_challenge_text,
+    tr,
 )
 
 ALICE = UserConfig(id=1, name="Alice")
@@ -362,6 +367,57 @@ class ParseChallengeTests(unittest.TestCase):
             challenge_expired({"deadline": (TODAY - timedelta(days=1)).isoformat()}, TODAY)
         )
         self.assertFalse(challenge_expired({"deadline": "garbage"}, TODAY))
+
+
+class DialectTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "data.json"
+        self.store = InstanceStore(self.path, [ALICE, BOB])
+        self.base = BotConfig(
+            token="t", users=[ALICE, BOB], data_path=self.path,
+            base_currency="MAD", rates_to_base={},
+        )
+
+    def test_dialect_toggle_persists(self):
+        self.assertFalse(self.store.config_for(self.base, "default").dialect)
+        self.store.set_dialect("default", True)
+        self.assertTrue(self.store.config_for(self.base, "default").dialect)
+        reloaded = InstanceStore(self.path, [ALICE, BOB])
+        self.assertTrue(reloaded.config_for(self.base, "default").dialect)
+
+    def test_dialect_is_per_instance(self):
+        self.store.ensure_instance("chat:-1", "Group", -1)
+        self.store.set_dialect("chat:-1", True)
+        self.assertTrue(self.store.config_for(self.base, "chat:-1").dialect)
+        self.assertFalse(self.store.config_for(self.base, "default").dialect)
+
+    def test_tr_picks_variant(self):
+        en_config = self.store.config_for(self.base, "default")
+        self.store.set_dialect("default", True)
+        bd_config = self.store.config_for(self.base, "default")
+        self.assertEqual(tr(en_config, "Hi {n}", "Hoi {n}", n=1), "Hi 1")
+        self.assertEqual(tr(bd_config, "Hi {n}", "Hoi {n}", n=1), "Hoi 1")
+
+    def test_formatting_switches_language(self):
+        self.store.set_dialect("default", True)
+        config = self.store.config_for(self.base, "default")
+        ledger = self.store.ledger_for("default")
+        agreement = ledger.create_agreement(ALICE, "kai Handy am Tisch")
+        text = format_agreement(agreement, config)
+        self.assertIn("offa", text)          # status word in dialect
+        self.assertIn("Mir wartet uf", text)
+        challenge = ledger.create_challenge(ALICE, "Liegestütz", 100, None)
+        text = format_challenge(challenge, config)
+        self.assertIn("Ziil 100", text)
+        net = {ALICE.id: 10.0, BOB.id: -10.0}
+        self.assertIn("schuldet", format_balance_lines(net, config))
+        # and everything stays English when the toggle is off
+        self.store.set_dialect("default", False)
+        config = self.store.config_for(self.base, "default")
+        self.assertIn("target 100", format_challenge(challenge, config))
+        self.assertIn("owes", format_balance_lines(net, config))
 
 
 class MultiInstanceTests(unittest.TestCase):

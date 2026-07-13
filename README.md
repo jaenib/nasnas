@@ -65,6 +65,10 @@ Add a schedule and/or period to `/agree` and the bot keeps score of compliance:
 - `/challenges [all|done]` — list challenges (default: active).
 - `/endchallenge [id]` — creator closes a challenge early; top scorer wins.
 
+## Bündnerdeutsch 🏔
+- `/dialekt` (or `/dialect`) toggles the bot's Bündnerdeutsch character per instance; `/dialekt on|off` sets it explicitly. The flag is persisted, so each group keeps its language.
+- Covers menus, buttons, expense/settle/balance replies, agreements, challenges, check-ins, push-up standings, and the daily prompts ("Und, häsch es hüt gschafft?"). Command names and rare internal error messages stay English.
+
 ## Tests
 ```bash
 python3 -m unittest discover -s tests -t .

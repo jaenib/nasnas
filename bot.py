@@ -64,6 +64,7 @@ class BotConfig:
     healthcheck_chat_id: Optional[int] = None
     instance_id: str = "default"
     instance_name: str = "Default"
+    dialect: bool = False  # Bündnerdeutsch character, toggled per instance
 
 
 def _env_int(key: str) -> int:
@@ -739,6 +740,10 @@ class InstanceStore:
         instance = self.state["instances"][instance_id]
         return Ledger(self.path, self.users_for(instance_id), state=instance, save_callback=self._save)
 
+    def set_dialect(self, instance_id: str, enabled: bool) -> None:
+        self.state["instances"][instance_id]["dialect"] = bool(enabled)
+        self._save()
+
     def config_for(self, base_config: BotConfig, instance_id: str) -> BotConfig:
         instance = self.state["instances"][instance_id]
         return BotConfig(
@@ -750,6 +755,7 @@ class InstanceStore:
             healthcheck_chat_id=base_config.healthcheck_chat_id,
             instance_id=instance_id,
             instance_name=str(instance.get("name") or instance_id),
+            dialect=bool(instance.get("dialect", False)),
         )
 
     def user_instances(self, user_id: int) -> List[Dict[str, Any]]:
@@ -1012,33 +1018,48 @@ def to_base(amount: float, currency: str, config: BotConfig) -> float:
     return amount * rate
 
 
-def format_balance_lines(net: Dict[int, float], users: List[UserConfig], base_currency: str) -> str:
+def format_balance_lines(net: Dict[int, float], config: BotConfig) -> str:
+    users = config.users
+    base_currency = config.base_currency
     lines = []
     for user in users:
         balance = net.get(user.id, 0.0)
         if balance > 0.01:
-            lines.append(f"{user.name} is owed {balance:.2f} {base_currency}.")
+            lines.append(
+                tr(config, "{name} is owed {amount:.2f} {cur}.",
+                   "{name} hät no {amount:.2f} {cur} z'guat.",
+                   name=user.name, amount=balance, cur=base_currency)
+            )
         elif balance < -0.01:
-            lines.append(f"{user.name} owes {-balance:.2f} {base_currency}.")
+            lines.append(
+                tr(config, "{name} owes {amount:.2f} {cur}.",
+                   "{name} schuldet {amount:.2f} {cur}.",
+                   name=user.name, amount=-balance, cur=base_currency)
+            )
         else:
-            lines.append(f"{user.name} is settled.")
+            lines.append(
+                tr(config, "{name} is settled.", "{name} isch quitt.", name=user.name)
+            )
 
     if len(users) == 2:
         diff = net.get(users[0].id, 0.0)
         if diff > 0.01:
-            lines.append(
-                f"{users[1].name} owes {users[0].name} {diff:.2f} {base_currency}."
-            )
+            debtor, creditor, amount = users[1].name, users[0].name, diff
         elif diff < -0.01:
-            lines.append(
-                f"{users[0].name} owes {users[1].name} {abs(diff):.2f} {base_currency}."
-            )
+            debtor, creditor, amount = users[0].name, users[1].name, abs(diff)
         else:
-            lines.append("All square. 🎉")
+            lines.append(tr(config, "All square. 🎉", "Alles quitt. 🎉"))
+            return "\n".join(lines)
+        lines.append(
+            tr(config, "{debtor} owes {creditor} {amount:.2f} {cur}.",
+               "{debtor} schuldet em {creditor} {amount:.2f} {cur}.",
+               debtor=debtor, creditor=creditor, amount=amount, cur=base_currency)
+        )
     return "\n".join(lines)
 
 
-def format_expense_line(expense: dict, base_currency: str) -> str:
+def format_expense_line(expense: dict, config: BotConfig) -> str:
+    base_currency = config.base_currency
     created = expense.get("created_at", "")
     try:
         timestamp = datetime.fromisoformat(created).astimezone(timezone.utc)
@@ -1053,12 +1074,15 @@ def format_expense_line(expense: dict, base_currency: str) -> str:
     base_note = ""
     if amount_base is not None and currency != base_currency:
         base_note = f" (base {amount_base:.2f} {base_currency})"
+    if config.dialect:
+        return f"{created_str}: {payer} hät {amount:.2f} {currency}{base_note} für {desc} zahlt"
     return f"{created_str}: {payer} paid {amount:.2f} {currency}{base_note} for {desc}"
 
 
-def format_entry_line(entry: dict, base_currency: str) -> str:
+def format_entry_line(entry: dict, config: BotConfig) -> str:
     entry_type = entry.get("type", "expense")
     if entry_type == "settlement":
+        base_currency = config.base_currency
         created = entry.get("created_at", "")
         try:
             ts = datetime.fromisoformat(created).astimezone(timezone.utc)
@@ -1075,20 +1099,30 @@ def format_entry_line(entry: dict, base_currency: str) -> str:
             base_note = f" (base {amount_base:.2f} {base_currency})"
         comment = entry.get("comment", "")
         cleared = entry.get("cleared_expenses", 0)
+        if config.dialect:
+            return (
+                f"{created_str}: Usglych — {payer} hät em {receiver} {amount:.2f} {currency}{base_note} "
+                f"zahlt; {cleared} Usgaba glöscht. Notiz: {comment or '—'}"
+            )
         return (
             f"{created_str}: Settlement {payer} paid {receiver} {amount:.2f} {currency}{base_note}; "
             f"cleared {cleared} expenses. Note: {comment or '—'}"
         )
-    return format_expense_line(entry, base_currency)
+    return format_expense_line(entry, config)
 
 
 def format_pushup_standings(
     pushups: Dict[int, int], config: BotConfig, date_label: str
 ) -> str:
     if not pushups:
-        return f"No push-ups logged for {date_label} yet."
+        return tr(
+            config,
+            "No push-ups logged for {date} yet.",
+            "Am {date} no kaini Liegestütz gmacht… hopp hopp!",
+            date=date_label,
+        )
 
-    lines = [f"Push-ups for {date_label}:"]
+    lines = [tr(config, "Push-ups for {date}:", "Liegestütz am {date}:", date=date_label)]
     sorted_users = sorted(
         config.users, key=lambda u: pushups.get(u.id, 0), reverse=True
     )
@@ -1098,9 +1132,15 @@ def format_pushup_standings(
         lines.append(f"- {user.name}: {pushups.get(user.id, 0)}")
     if top > 0:
         if len(winners) == 1:
-            lines.append(f"🏅 Winner: {winners[0]} ({top})")
+            lines.append(
+                tr(config, "🏅 Winner: {name} ({top})", "🏅 Gwünner: {name} ({top})",
+                   name=winners[0], top=top)
+            )
         else:
-            lines.append(f"🤝 Tie: {', '.join(winners)} ({top})")
+            lines.append(
+                tr(config, "🤝 Tie: {names} ({top})", "🤝 Glychstand: {names} ({top})",
+                   names=", ".join(winners), top=top)
+            )
     return "\n".join(lines)
 
 
@@ -1112,6 +1152,55 @@ STATUS_ICONS = {
     "completed": "🏁",
     "ended": "🏁",
 }
+
+# ------------------- Bündnerdeutsch character (toggleable) ------------------ #
+
+def tr(config: BotConfig, en: str, bd: str, **kwargs: Any) -> str:
+    """Pick the English or Bündnerdeutsch variant of a phrase.
+
+    Both variants live at the call site so they stay in sync; kwargs are
+    format()-substituted into whichever is chosen.
+    """
+    text = bd if config.dialect else en
+    return text.format(**kwargs) if kwargs else text
+
+
+STATUS_WORDS_BD = {
+    "pending": "offa",
+    "active": "aktiv",
+    "revoked": "zruggzoga",
+    "cancelled": "abbrocha",
+    "completed": "duregzoga",
+    "ended": "fertig",
+}
+
+CHECKIN_KIND_BD = {
+    "daily": "jeda Tag",
+    "weekdays": "wärchtigs",
+    "weekends": "am Wuchanänd",
+}
+
+
+def status_word(config: BotConfig, status: str) -> str:
+    if config.dialect:
+        return STATUS_WORDS_BD.get(status, status)
+    return status
+
+
+def participant_gate(config: BotConfig) -> str:
+    return tr(
+        config,
+        "You're not on the participant list for this instance.",
+        "Du bisch bi dem da nid debii, sorry.",
+    )
+
+
+def traveler_gate(config: BotConfig) -> str:
+    return tr(
+        config,
+        "You're not on the traveler list for this bot.",
+        "Du stahsch nid uf dr Lischta vo dem Bot, sorry.",
+    )
 
 
 def display_name(user_id: int, participants: Dict[str, Any], config: BotConfig) -> str:
@@ -1151,23 +1240,24 @@ def format_agreement(agreement: dict, config: BotConfig, today=None) -> str:
     status = agreement.get("status", "pending")
     icon = STATUS_ICONS.get(status, "")
     lines = [f"📜 {agreement.get('id')} — {agreement.get('text')}"]
-    lines.append(f"Status: {icon} {status}".rstrip())
+    lines.append(f"Status: {icon} {status_word(config, status)}".rstrip())
     checkin = agreement.get("checkin")
     if checkin:
         kind = checkin.get("days", "daily")
+        kind_label = CHECKIN_KIND_BD.get(kind, kind) if config.dialect else kind
         until = checkin.get("until")
-        line = f"📅 Check-in {kind}"
+        line = f"📅 Check-in {kind_label}"
         if until:
+            until_word = tr(config, "until", "bis")
+            line += f" {until_word} {until}"
             if status == "active":
                 try:
                     days_left = (
                         datetime.strptime(str(until), "%Y-%m-%d").date() - today
                     ).days
-                    line += f" until {until} ({days_left}d left)"
+                    line += tr(config, " ({n}d left)", " (no {n} Täg)", n=days_left)
                 except ValueError:
-                    line += f" until {until}"
-            else:
-                line += f" until {until}"
+                    pass
         lines.append(line)
         if status in ("active", "completed"):
             for uid in accepted:
@@ -1175,7 +1265,7 @@ def format_agreement(agreement: dict, config: BotConfig, today=None) -> str:
     if accepted:
         lines.append("✅ " + ", ".join(display_name(uid, participants, config) for uid in accepted))
     else:
-        lines.append("✅ nobody yet")
+        lines.append(tr(config, "✅ nobody yet", "✅ no niamert"))
     if declined:
         lines.append("❌ " + ", ".join(display_name(uid, participants, config) for uid in declined))
     if status == "pending":
@@ -1185,7 +1275,7 @@ def format_agreement(agreement: dict, config: BotConfig, today=None) -> str:
             if user.id not in accepted and user.id not in declined
         ]
         if waiting:
-            lines.append("Waiting on: " + ", ".join(waiting))
+            lines.append(tr(config, "Waiting on: ", "Mir wartet uf: ") + ", ".join(waiting))
     breaches = agreement.get("breaches", [])
     if breaches:
         counts: Dict[int, int] = {}
@@ -1196,10 +1286,13 @@ def format_agreement(agreement: dict, config: BotConfig, today=None) -> str:
             f"{display_name(uid, participants, config)} ×{count}"
             for uid, count in sorted(counts.items(), key=lambda kv: -kv[1])
         )
-        lines.append(f"⚠️ Breaches: {strikes}")
+        lines.append(tr(config, "⚠️ Breaches: ", "⚠️ Verstöss: ") + strikes)
         last = breaches[-1]
         note = str(last.get("note") or "").strip()
-        latest = f"   latest: {display_name(int(last.get('user_id', 0)), participants, config)}"
+        latest = (
+            tr(config, "   latest: ", "   zletscht: ")
+            + display_name(int(last.get("user_id", 0)), participants, config)
+        )
         if note:
             latest += f" — “{note}”"
         lines.append(latest)
@@ -1236,23 +1329,27 @@ def format_challenge(challenge: dict, config: BotConfig, today=None) -> str:
     deadline = challenge.get("deadline")
     meta = []
     if target:
-        meta.append(f"target {target}")
+        meta.append(tr(config, "target {t}", "Ziil {t}", t=target))
     if deadline:
         if status == "active":
             try:
                 days_left = (datetime.strptime(str(deadline), "%Y-%m-%d").date() - today).days
-                meta.append(
-                    f"ends {deadline} ({days_left}d left)" if days_left >= 0 else f"ended {deadline}"
-                )
+                if days_left >= 0:
+                    meta.append(
+                        tr(config, "ends {d} ({n}d left)", "bis {d} (no {n} Täg)",
+                           d=deadline, n=days_left)
+                    )
+                else:
+                    meta.append(tr(config, "ended {d}", "fertig sit {d}", d=deadline))
             except ValueError:
-                meta.append(f"ends {deadline}")
+                meta.append(tr(config, "ends {d}", "bis {d}", d=deadline))
         else:
-            meta.append(f"deadline {deadline}")
+            meta.append(tr(config, "deadline {d}", "Frischt {d}", d=deadline))
     header = f"🏆 {challenge.get('id')} — {challenge.get('title')}"
     if meta:
         header += " (" + ", ".join(meta) + ")"
 
-    lines = [header, f"Status: {icon} {status}".rstrip()]
+    lines = [header, f"Status: {icon} {status_word(config, status)}".rstrip()]
     if target:
         bar = progress_bar(max(scores.values(), default=0), int(target))
         if bar:
@@ -1265,7 +1362,7 @@ def format_challenge(challenge: dict, config: BotConfig, today=None) -> str:
     winner_ids = challenge.get("winner_ids") or []
     if status in ("completed", "ended") and winner_ids:
         names = ", ".join(display_name(int(uid), participants, config) for uid in winner_ids)
-        lines.append(f"🏆 Winner: {names}")
+        lines.append(tr(config, "🏆 Winner: {names}", "🏆 Gwünner: {names}", names=names))
     return "\n".join(lines)
 
 
@@ -1374,57 +1471,73 @@ def build_currency_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[b] for b in buttons])
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def main_menu_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("➕ Expense", callback_data=f"{CB_MENU_PREFIX}add_expense")],
+            [InlineKeyboardButton(tr(config, "➕ Expense", "➕ Usgab"),
+                                  callback_data=f"{CB_MENU_PREFIX}add_expense")],
             [
-                InlineKeyboardButton("📊 Balance", callback_data=f"{CB_MENU_PREFIX}balance"),
-                InlineKeyboardButton("🕑 History", callback_data=f"{CB_MENU_PREFIX}history"),
+                InlineKeyboardButton(tr(config, "📊 Balance", "📊 Bilanz"),
+                                     callback_data=f"{CB_MENU_PREFIX}balance"),
+                InlineKeyboardButton(tr(config, "🕑 History", "🕑 Verlauf"),
+                                     callback_data=f"{CB_MENU_PREFIX}history"),
             ],
-            [InlineKeyboardButton("✅ Settle", callback_data=f"{CB_MENU_PREFIX}settle")],
+            [InlineKeyboardButton(tr(config, "✅ Settle", "✅ Usglych"),
+                                  callback_data=f"{CB_MENU_PREFIX}settle")],
             [
-                InlineKeyboardButton("🏆 Challenges", callback_data=f"{CB_MENU_PREFIX}challenges"),
-                InlineKeyboardButton("🤝 Agreements", callback_data=f"{CB_MENU_PREFIX}agreements"),
+                InlineKeyboardButton(tr(config, "🏆 Challenges", "🏆 Usforderiga"),
+                                     callback_data=f"{CB_MENU_PREFIX}challenges"),
+                InlineKeyboardButton(tr(config, "🤝 Agreements", "🤝 Abkomma"),
+                                     callback_data=f"{CB_MENU_PREFIX}agreements"),
             ],
-            [InlineKeyboardButton("💪 Push-ups", callback_data=f"{CB_MENU_PREFIX}pushups")],
-            [InlineKeyboardButton("🏅 Standings", callback_data=f"{CB_MENU_PREFIX}pushups_standings")],
-            [InlineKeyboardButton("ℹ️ Help", callback_data=f"{CB_MENU_PREFIX}help")],
+            [InlineKeyboardButton(tr(config, "💪 Push-ups", "💪 Liegestütz"),
+                                  callback_data=f"{CB_MENU_PREFIX}pushups")],
+            [InlineKeyboardButton(tr(config, "🏅 Standings", "🏅 Rangliste"),
+                                  callback_data=f"{CB_MENU_PREFIX}pushups_standings")],
+            [InlineKeyboardButton(tr(config, "ℹ️ Help", "ℹ️ Hilf"),
+                                  callback_data=f"{CB_MENU_PREFIX}help")],
         ]
     )
 
 
-def agreement_keyboard(instance_id: str, agreement_id: str) -> InlineKeyboardMarkup:
+def agreement_keyboard(config: BotConfig, agreement_id: str) -> InlineKeyboardMarkup:
+    instance_id = config.instance_id
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ Accept", callback_data=f"agr|a|{instance_id}|{agreement_id}"
+                    tr(config, "✅ Accept", "✅ Bin debii"),
+                    callback_data=f"agr|a|{instance_id}|{agreement_id}",
                 ),
                 InlineKeyboardButton(
-                    "❌ Decline", callback_data=f"agr|d|{instance_id}|{agreement_id}"
+                    tr(config, "❌ Decline", "❌ Nai, sorry"),
+                    callback_data=f"agr|d|{instance_id}|{agreement_id}",
                 ),
             ]
         ]
     )
 
 
-def checkin_keyboard(instance_id: str, agreement_id: str, day_iso: str) -> InlineKeyboardMarkup:
+def checkin_keyboard(config: BotConfig, agreement_id: str, day_iso: str) -> InlineKeyboardMarkup:
+    instance_id = config.instance_id
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ Made it", callback_data=f"chk|y|{instance_id}|{agreement_id}|{day_iso}"
+                    tr(config, "✅ Made it", "✅ Gschafft"),
+                    callback_data=f"chk|y|{instance_id}|{agreement_id}|{day_iso}",
                 ),
                 InlineKeyboardButton(
-                    "❌ Missed", callback_data=f"chk|n|{instance_id}|{agreement_id}|{day_iso}"
+                    tr(config, "❌ Missed", "❌ Verpasst"),
+                    callback_data=f"chk|n|{instance_id}|{agreement_id}|{day_iso}",
                 ),
             ]
         ]
     )
 
 
-def challenge_keyboard(instance_id: str, challenge_id: str) -> InlineKeyboardMarkup:
+def challenge_keyboard(config: BotConfig, challenge_id: str) -> InlineKeyboardMarkup:
+    instance_id = config.instance_id
     return InlineKeyboardMarkup(
         [
             [
@@ -1433,14 +1546,20 @@ def challenge_keyboard(instance_id: str, challenge_id: str) -> InlineKeyboardMar
                 InlineKeyboardButton("+10", callback_data=f"chl|s|{instance_id}|{challenge_id}|10"),
             ],
             [
-                InlineKeyboardButton("📊 Standings", callback_data=f"chl|v|{instance_id}|{challenge_id}"),
-                InlineKeyboardButton("🏁 End", callback_data=f"chl|e|{instance_id}|{challenge_id}"),
+                InlineKeyboardButton(
+                    tr(config, "📊 Standings", "📊 Zwüschastand"),
+                    callback_data=f"chl|v|{instance_id}|{challenge_id}",
+                ),
+                InlineKeyboardButton(
+                    tr(config, "🏁 End", "🏁 Fertig"),
+                    callback_data=f"chl|e|{instance_id}|{challenge_id}",
+                ),
             ],
         ]
     )
 
 
-def pushups_keyboard() -> InlineKeyboardMarkup:
+def pushups_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -1451,8 +1570,10 @@ def pushups_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("+20", callback_data=f"{CB_PUSHUPS_ADD_PREFIX}20"),
                 InlineKeyboardButton("+30", callback_data=f"{CB_PUSHUPS_ADD_PREFIX}30"),
             ],
-            [InlineKeyboardButton("Enter custom", callback_data=f"{CB_PUSHUPS_PREFIX}custom")],
-            [InlineKeyboardButton("Back to menu", callback_data=f"{CB_MENU_PREFIX}home")],
+            [InlineKeyboardButton(tr(config, "Enter custom", "Anderi Zahl"),
+                                  callback_data=f"{CB_PUSHUPS_PREFIX}custom")],
+            [InlineKeyboardButton(tr(config, "Back to menu", "Zrugg zum Menü"),
+                                  callback_data=f"{CB_MENU_PREFIX}home")],
         ]
     )
 
@@ -1492,7 +1613,7 @@ async def currency_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     receiver_id = pending.get("receiver_id")
     actor = user_from_id(query.from_user.id, config)
     if not actor:
-        await query.edit_message_text("You're not on the traveler list for this bot.")
+        await query.edit_message_text(traveler_gate(config))
         return
 
     if kind == "expense":
@@ -1518,33 +1639,64 @@ async def currency_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, config = get_runtime_for_update(update, context)
-    names = " & ".join([u.name for u in config.users]) or "No participants yet"
-    help_text = (
-        "Shared group bot is online.\n"
-        "Add expenses by sending: `<amount> [CUR] <description>`\n"
-        f"If no currency is given, I'll ask (options: {', '.join(available_currencies(config))}).\n"
-        "Push-ups: `/pushups <count>` or tap the push-up buttons.\n\n"
-        "Money:\n"
-        "- /add 23.50 dinner, /balance, /history\n"
-        "- /settle [comment]  (records who owed whom, marks it paid, clears expenses)\n"
-        "- /join / /leave  (opt in/out of expense splitting in this group)\n\n"
-        "Agreements 🤝:\n"
-        "- /agree <text>  (propose; active once two people accept)\n"
-        "- /agree <text> [daily|weekdays|weekends] [for 1y]  (adds a daily check-in)\n"
-        "- /checkin [id] [yes|no]  (answer today's check-in; I also ask daily at 18:00 UTC)\n"
-        "- /accept [id], /decline [id], /revoke <id>\n"
-        "- /breach [id] [name] [note]  (record a broken agreement — reply to someone to blame them)\n"
-        "- /agreements [all|active|pending|done]\n\n"
-        "Challenges 🏆:\n"
-        "- /challenge [target] <title> [for 7d | until YYYY-MM-DD]\n"
-        "- /score [id] <amount>  (negative corrects mistakes)\n"
-        "- /challenges [all|done], /endchallenge [id]\n\n"
-        f"Instance: {config.instance_name} (`{config.instance_id}`)\n"
-        f"Expense participants: {names}\n"
-        "Expenses are split evenly between joined participants.\n\n"
-        "Use the inline menu below for quick actions."
-    )
-    await update.message.reply_text(help_text, reply_markup=main_menu_keyboard())
+    currencies = ", ".join(available_currencies(config))
+    if config.dialect:
+        names = " & ".join([u.name for u in config.users]) or "no niamert"
+        help_text = (
+            "Hoi zäma! Dr Gruppa-Bot isch parat. 🏔\n"
+            "Usgaba iitraga: `<Betrag> [CUR] <Beschriibig>`\n"
+            f"Ohni Währig frög i naa (Optiona: {currencies}).\n"
+            "Liegestütz: `/pushups <Zahl>` oder d'Chnöpf drucka.\n\n"
+            "Gäld:\n"
+            "- /add 23.50 Znacht, /balance, /history\n"
+            "- /settle [Kommentar]  (schriibt uf, wer wem was schuldet, und stellt uf null)\n"
+            "- /join / /leave  (bim Usgaba-Teila mitmacha oder nüma)\n\n"
+            "Abkomma 🤝:\n"
+            "- /agree <Text>  (vorschlah; gilt ab zwei Zuesaga)\n"
+            "- /agree <Text> [daily|weekdays|weekends] [for 1y]  (mit täglichem Check-in)\n"
+            "- /checkin [id] [yes|no]  (hüt gschafft? I frög au sälber, jeda Tag am 18:00 UTC)\n"
+            "- /accept [id], /decline [id], /revoke <id>\n"
+            "- /breach [id] [Nama] [Notiz]  (Verstoss ufschriiba — uf a Nachricht antworta zum öpper aaschwärza)\n"
+            "- /agreements [all|active|pending|done]\n\n"
+            "Usforderiga 🏆:\n"
+            "- /challenge [Ziil] <Titel> [for 7d | until YYYY-MM-DD]\n"
+            "- /score [id] <Zahl>  (negativ zum korrigiara)\n"
+            "- /challenges [all|done], /endchallenge [id]\n\n"
+            "Susch: /dialekt off zum wieder Änglisch reda.\n\n"
+            f"Instanz: {config.instance_name} (`{config.instance_id}`)\n"
+            f"Usgaba-Teilnehmer: {names}\n"
+            "Usgaba werdet glychmässig teilt.\n\n"
+            "S'Menü isch unt. Tgau!"
+        )
+    else:
+        names = " & ".join([u.name for u in config.users]) or "No participants yet"
+        help_text = (
+            "Shared group bot is online.\n"
+            "Add expenses by sending: `<amount> [CUR] <description>`\n"
+            f"If no currency is given, I'll ask (options: {currencies}).\n"
+            "Push-ups: `/pushups <count>` or tap the push-up buttons.\n\n"
+            "Money:\n"
+            "- /add 23.50 dinner, /balance, /history\n"
+            "- /settle [comment]  (records who owed whom, marks it paid, clears expenses)\n"
+            "- /join / /leave  (opt in/out of expense splitting in this group)\n\n"
+            "Agreements 🤝:\n"
+            "- /agree <text>  (propose; active once two people accept)\n"
+            "- /agree <text> [daily|weekdays|weekends] [for 1y]  (adds a daily check-in)\n"
+            "- /checkin [id] [yes|no]  (answer today's check-in; I also ask daily at 18:00 UTC)\n"
+            "- /accept [id], /decline [id], /revoke <id>\n"
+            "- /breach [id] [name] [note]  (record a broken agreement — reply to someone to blame them)\n"
+            "- /agreements [all|active|pending|done]\n\n"
+            "Challenges 🏆:\n"
+            "- /challenge [target] <title> [for 7d | until YYYY-MM-DD]\n"
+            "- /score [id] <amount>  (negative corrects mistakes)\n"
+            "- /challenges [all|done], /endchallenge [id]\n\n"
+            "Extras: /dialekt — flip the bot into Bündnerdeutsch.\n\n"
+            f"Instance: {config.instance_name} (`{config.instance_id}`)\n"
+            f"Expense participants: {names}\n"
+            "Expenses are split evenly between joined participants.\n\n"
+            "Use the inline menu below for quick actions."
+        )
+    await update.message.reply_text(help_text, reply_markup=main_menu_keyboard(config))
 
 
 async def add_expense_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1554,7 +1706,7 @@ async def add_expense_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     actor = user_from_id(user.id, config)
     if not actor:
-        await update.message.reply_text("You're not on the traveler list for this bot.")
+        await update.message.reply_text(traveler_gate(config))
         return
 
     text = " ".join(context.args) if context.args else ""
@@ -1573,7 +1725,7 @@ async def add_expense_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             "instance_id": config.instance_id,
         }
         await update.message.reply_text(
-            "Choose a currency:",
+            tr(config, "Choose a currency:", "Welli Währig?"),
             reply_markup=build_currency_keyboard(config),
         )
         return
@@ -1627,32 +1779,37 @@ async def finalize_expense(
         config.base_currency,
     )
     net = ledger.balances()
-    balance_text = format_balance_lines(net, config.users, config.base_currency)
+    balance_text = format_balance_lines(net, config)
     reply_text = (
-        f"Logged {amount:.2f} {currency} for '{description}' as paid by {actor.name}.\n\n{balance_text}"
+        tr(config,
+           "Logged {amount:.2f} {currency} for '{description}' as paid by {name}.",
+           "Han {amount:.2f} {currency} für «{description}» ufgschriba — zahlt hät dr {name}.",
+           amount=amount, currency=currency, description=description, name=actor.name)
+        + f"\n\n{balance_text}"
     )
     if hasattr(update, "message") and update.message:
-        await update.message.reply_text(reply_text, reply_markup=main_menu_keyboard())
+        await update.message.reply_text(reply_text, reply_markup=main_menu_keyboard(config))
     elif hasattr(update, "edit_message_text"):
-        await update.edit_message_text(reply_text, reply_markup=main_menu_keyboard())
+        await update.edit_message_text(reply_text, reply_markup=main_menu_keyboard(config))
 
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ledger, config = get_runtime_for_update(update, context)
     net = ledger.balances()
-    text = format_balance_lines(net, config.users, config.base_currency)
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    text = format_balance_lines(net, config)
+    await update.message.reply_text(text, reply_markup=main_menu_keyboard(config))
 
 
 async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ledger, config = get_runtime_for_update(update, context)
     entries = ledger.last_entries(limit=10)
     if not entries:
-        await update.message.reply_text("No expenses yet.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(tr(config, "No expenses yet.", "No kai Usgaba da."), reply_markup=main_menu_keyboard(config))
         return
-    lines = [format_entry_line(exp, config.base_currency) for exp in entries]
+    lines = [format_entry_line(exp, config) for exp in entries]
     await update.message.reply_text(
-        "Recent activity:\n" + "\n".join(lines), reply_markup=main_menu_keyboard()
+        tr(config, "Recent activity:", "Di letschta Iiträg:") + "\n" + "\n".join(lines),
+        reply_markup=main_menu_keyboard(config)
     )
 
 
@@ -1671,9 +1828,11 @@ async def join_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     store.add_member(instance_id, user.id, name)
     _, config = get_runtime_for_update(update, context)
     await update.message.reply_text(
-        f"{name} joined {config.instance_name}. Participants: "
-        f"{', '.join([u.name for u in config.users])}",
-        reply_markup=main_menu_keyboard(),
+        tr(config, "{name} joined {instance}. Participants: {members}",
+           "Dr {name} isch jetz bi «{instance}» debii. Mit debii: {members}",
+           name=name, instance=config.instance_name,
+           members=", ".join([u.name for u in config.users])),
+        reply_markup=main_menu_keyboard(config),
     )
 
 
@@ -1686,7 +1845,9 @@ async def leave_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("The default DM instance keeps its configured users.")
         return
     store.remove_member(instance_id, update.effective_user.id)
-    await update.message.reply_text("You left this instance.")
+    base_config: BotConfig = context.application.bot_data["base_config"]
+    config = store.config_for(base_config, instance_id)
+    await update.message.reply_text(tr(config, "You left this instance.", "Du bisch jetz nüma debii. Tgau!"))
 
 
 async def instance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1734,7 +1895,30 @@ async def use_instance_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"Active DM instance set to {config.instance_name}.")
 
 
-PARTICIPANT_GATE_TEXT = "You're not on the participant list for this instance."
+async def dialekt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle the bot's Bündnerdeutsch character for this instance."""
+    if not update.message:
+        return
+    store: InstanceStore = context.application.bot_data["store"]
+    instance_id = store.instance_id_for_update(update, context)
+    current = bool(store.state["instances"][instance_id].get("dialect", False))
+    arg = context.args[0].lower() if context.args else None
+    if arg in ("on", "an", "ii", "ja", "yes"):
+        enabled = True
+    elif arg in ("off", "us", "aus", "nai", "nei", "no"):
+        enabled = False
+    else:
+        enabled = not current
+    store.set_dialect(instance_id, enabled)
+    if enabled:
+        await update.message.reply_text(
+            "Allegra! 🏔 Ab sofort redt dr Bot Bündnerdütsch.\n"
+            "Zum Zruggwechsla: /dialekt off. Tgau derwiil!"
+        )
+    else:
+        await update.message.reply_text(
+            "Alright, back to English. Type /dialekt to bring the Bündner back. 🏔"
+        )
 
 
 def build_agreement_list(ledger: Ledger, config: BotConfig, which: str) -> str:
@@ -1751,8 +1935,9 @@ def build_agreement_list(ledger: Ledger, config: BotConfig, which: str) -> str:
         selected = [a for a in agreements if a.get("status") in ("pending", "active")]
     selected = selected[-10:]
     if not selected:
-        return f"No {which} agreements here. Propose one with /agree <text>."
-    return f"Agreements ({which}):\n\n" + "\n\n".join(
+        return tr(config, "No {which} agreements here. Propose one with /agree <text>.",
+                  "Kaini Abkomma da ({which}). Schlah ais vor mit /agree <Text>.", which=which)
+    return tr(config, "Agreements ({which}):", "Abkomma ({which}):", which=which) + "\n\n" + "\n\n".join(
         format_agreement(a, config) for a in selected
     )
 
@@ -1772,15 +1957,17 @@ def build_challenge_list(
     selected = selected[-10:]
     if not selected:
         return (
-            f"No {which} challenges here. Start one with {CHALLENGE_USAGE[5:]}",
+            tr(config, "No {which} challenges here. Start one with {usage}",
+               "Kaini Usforderiga da ({which}). Startet aini mit {usage}",
+               which=which, usage=CHALLENGE_USAGE[5:]),
             None,
         )
-    text = f"Challenges ({which}):\n\n" + "\n\n".join(
+    text = tr(config, "Challenges ({which}):", "Usforderiga ({which}):", which=which) + "\n\n" + "\n\n".join(
         format_challenge(c, config, today) for c in selected
     )
     active = [c for c in selected if c.get("status") == "active"]
     keyboard = (
-        challenge_keyboard(config.instance_id, str(active[-1]["id"])) if active else None
+        challenge_keyboard(config, str(active[-1]["id"])) if active else None
     )
     return text, keyboard
 
@@ -1792,7 +1979,7 @@ async def agree_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     today = datetime.now(timezone.utc).date()
     try:
@@ -1803,13 +1990,18 @@ async def agree_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     extra = ""
     if checkin:
-        extra = "\nI'll ask for a daily check-in on scheduled days (or use /checkin yes|no)."
+        extra = "\n" + tr(config,
+            "I'll ask for a daily check-in on scheduled days (or use /checkin yes|no).",
+            "I frög a jedam planta Tag naa, öb ihr's gschafft händ (oder bruuch /checkin yes|no).")
     await update.message.reply_text(
-        f"Agreement proposed by {actor.name}.\n\n"
-        f"{format_agreement(agreement, config, today)}\n\n"
-        "Tap a button or use /accept, /decline. It takes effect once two people are in."
+        tr(config, "Agreement proposed by {name}.", "Dr {name} schlaht as Abkomma vor.",
+           name=actor.name)
+        + f"\n\n{format_agreement(agreement, config, today)}\n\n"
+        + tr(config,
+             "Tap a button or use /accept, /decline. It takes effect once two people are in.",
+             "Tipp uf a Chnopf oder bruuch /accept, /decline. Es gilt, sobald zwei debii sind.")
         + extra,
-        reply_markup=agreement_keyboard(config.instance_id, str(agreement["id"])),
+        reply_markup=agreement_keyboard(config, str(agreement["id"])),
     )
 
 
@@ -1822,14 +2014,14 @@ async def respond_agreement_command(
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     agreement_id = context.args[0] if context.args else None
     agreement = (
         ledger.find_agreement(agreement_id) if agreement_id else ledger.latest_open_agreement()
     )
     if not agreement:
-        await update.message.reply_text("No matching agreement found. See /agreements.")
+        await update.message.reply_text(tr(config, "No matching agreement found. See /agreements.", "Kai passends Abkomma gfunda. Luag bi /agreements."))
         return
     was_active = agreement.get("status") == "active"
     try:
@@ -1839,7 +2031,8 @@ async def respond_agreement_command(
         return
     text = format_agreement(agreement, config)
     if not was_active and agreement.get("status") == "active":
-        text = "🤝 Agreement is now ACTIVE.\n\n" + text
+        text = tr(config, "🤝 Agreement is now ACTIVE.",
+                  "🤝 Abgmacht isch abgmacht — s'Abkomma gilt jetz!") + "\n\n" + text
         await announce_to_instance(
             context,
             config,
@@ -1847,7 +2040,7 @@ async def respond_agreement_command(
             text,
         )
     keyboard = (
-        agreement_keyboard(config.instance_id, str(agreement["id"]))
+        agreement_keyboard(config, str(agreement["id"]))
         if agreement.get("status") in ("pending", "active")
         else None
     )
@@ -1869,7 +2062,7 @@ async def revoke_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     if not context.args:
         await update.message.reply_text("Use: /revoke <agreement_id>")
@@ -1879,7 +2072,8 @@ async def revoke_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
-    text = f"Agreement revoked by {actor.name}.\n\n{format_agreement(agreement, config)}"
+    text = tr(config, "Agreement revoked by {name}.", "Dr {name} hät s'Abkomma zruggzoga.",
+              name=actor.name) + f"\n\n{format_agreement(agreement, config)}"
     await update.message.reply_text(text)
     await announce_to_instance(
         context, config, update.effective_chat.id if update.effective_chat else None, text
@@ -1893,7 +2087,7 @@ async def breach_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     args = list(context.args or [])
     agreement = None
@@ -1933,8 +2127,10 @@ async def breach_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         1 for b in agreement.get("breaches", []) if int(b.get("user_id", 0)) == offender.id
     )
     text = (
-        f"⚠️ Breach recorded against {offender.name} (strike {strikes}).\n\n"
-        f"{format_agreement(agreement, config)}"
+        tr(config, "⚠️ Breach recorded against {name} (strike {n}).",
+           "⚠️ Verstoss vom {name} vermerkt (Strich Nr. {n}).",
+           name=offender.name, n=strikes)
+        + f"\n\n{format_agreement(agreement, config)}"
     )
     await update.message.reply_text(text)
     await announce_to_instance(
@@ -1959,7 +2155,7 @@ async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     args = list(context.args or [])
     agreement = None
@@ -1971,8 +2167,11 @@ async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         agreement = ledger.latest_checkin_agreement()
     if not agreement or not agreement.get("checkin"):
         await update.message.reply_text(
-            "No active agreement with a daily check-in. Create one like:\n"
-            "/agree meet at 8:30 every day for 1y"
+            tr(config,
+               "No active agreement with a daily check-in. Create one like:\n"
+               "/agree meet at 8:30 every day for 1y",
+               "Kai aktivs Abkomma mit Check-in. Mach ais eso:\n"
+               "/agree am 8:30 träffa every day for 1y")
         )
         return
     today = datetime.now(timezone.utc).date()
@@ -1980,7 +2179,7 @@ async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not args:
         await update.message.reply_text(
             format_checkin_day(agreement, config, day_iso, today),
-            reply_markup=checkin_keyboard(config.instance_id, str(agreement["id"]), day_iso),
+            reply_markup=checkin_keyboard(config, str(agreement["id"]), day_iso),
         )
         return
     answer = args[0].lower()
@@ -2015,20 +2214,20 @@ async def checkin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ledger, config = runtime
     actor = resolve_participant(query.from_user, config)
     if not actor:
-        await query.answer(PARTICIPANT_GATE_TEXT, show_alert=True)
+        await query.answer(participant_gate(config), show_alert=True)
         return
     try:
         agreement = ledger.record_checkin(agreement_id, actor, day_iso, answer == "y")
     except ValueError as exc:
         await query.answer(str(exc), show_alert=True)
         return
-    await query.answer("Recorded ✅" if answer == "y" else "Recorded ❌")
+    await query.answer(tr(config, "Recorded ✅", "Notiert ✅ Suuber!") if answer == "y" else tr(config, "Recorded ❌", "Notiert ❌ Morn wieder, gäll."))
     today = datetime.now(timezone.utc).date()
     text = format_checkin_day(agreement, config, day_iso, today)
     try:
         # Keep the buttons so others (or a change of heart) can still answer.
         await query.edit_message_text(
-            text, reply_markup=checkin_keyboard(instance_id, agreement_id, day_iso)
+            text, reply_markup=checkin_keyboard(config, agreement_id, day_iso)
         )
     except Exception:
         pass  # message unchanged (same answer tapped twice) or no longer editable
@@ -2041,7 +2240,7 @@ async def challenge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     today = datetime.now(timezone.utc).date()
     try:
@@ -2051,9 +2250,12 @@ async def challenge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(str(exc))
         return
     await update.message.reply_text(
-        f"Challenge on! 🏁\n\n{format_challenge(challenge, config, today)}\n\n"
-        f"Log progress with the buttons or /score {challenge['id']} <amount>.",
-        reply_markup=challenge_keyboard(config.instance_id, str(challenge["id"])),
+        tr(config, "Challenge on! 🏁", "D'Usforderig lauft! 🏁")
+        + f"\n\n{format_challenge(challenge, config, today)}\n\n"
+        + tr(config, "Log progress with the buttons or /score {id} <amount>.",
+             "Fortschritt mit da Chnöpf iitraga oder /score {id} <Zahl>.",
+             id=challenge["id"]),
+        reply_markup=challenge_keyboard(config, str(challenge["id"])),
     )
 
 
@@ -2064,7 +2266,7 @@ async def score_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     args = list(context.args or [])
     challenge_id: Optional[str] = None
@@ -2080,11 +2282,11 @@ async def score_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if challenge_id is None:
         challenge = ledger.latest_active_challenge()
         if not challenge:
-            await update.message.reply_text("No active challenge. Start one with /challenge.")
+            await update.message.reply_text(tr(config, "No active challenge. Start one with /challenge.", "Kai aktivi Usforderig. Startet aini mit /challenge."))
             return
         challenge_id = str(challenge["id"])
     if not SCORE_AMOUNT_PATTERN.match(raw_amount):
-        await update.message.reply_text(f"'{raw_amount}' is not a whole number.")
+        await update.message.reply_text(tr(config, "'{raw}' is not a whole number.", "«{raw}» isch kai ganzi Zahl.", raw=raw_amount))
         return
     try:
         challenge, completed = ledger.add_challenge_score(challenge_id, actor, int(raw_amount))
@@ -2094,14 +2296,16 @@ async def score_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     today = datetime.now(timezone.utc).date()
     text = format_challenge(challenge, config, today)
     if completed:
-        text = f"🎉 {actor.name} hit the target — challenge complete!\n\n" + text
+        text = tr(config, "🎉 {name} hit the target — challenge complete!",
+                  "🎉 Dr {name} hät s'Ziil gknackt — Usforderig gschafft!",
+                  name=actor.name) + "\n\n" + text
         await update.message.reply_text(text)
         await announce_to_instance(
             context, config, update.effective_chat.id if update.effective_chat else None, text
         )
     else:
         await update.message.reply_text(
-            text, reply_markup=challenge_keyboard(config.instance_id, str(challenge["id"]))
+            text, reply_markup=challenge_keyboard(config, str(challenge["id"]))
         )
 
 
@@ -2112,7 +2316,7 @@ async def end_challenge_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     actor = resolve_participant(user, config)
     if not actor:
-        await update.message.reply_text(PARTICIPANT_GATE_TEXT)
+        await update.message.reply_text(participant_gate(config))
         return
     challenge = (
         ledger.find_challenge(context.args[0])
@@ -2128,7 +2332,7 @@ async def end_challenge_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(str(exc))
         return
     today = datetime.now(timezone.utc).date()
-    text = "🏁 Challenge ended.\n\n" + format_challenge(challenge, config, today)
+    text = tr(config, "🏁 Challenge ended.", "🏁 Usforderig fertig.") + "\n\n" + format_challenge(challenge, config, today)
     await update.message.reply_text(text)
     await announce_to_instance(
         context, config, update.effective_chat.id if update.effective_chat else None, text
@@ -2160,7 +2364,7 @@ async def agreement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ledger, config = runtime
     actor = resolve_participant(query.from_user, config)
     if not actor:
-        await query.answer(PARTICIPANT_GATE_TEXT, show_alert=True)
+        await query.answer(participant_gate(config), show_alert=True)
         return
     agreement = ledger.find_agreement(agreement_id)
     if not agreement:
@@ -2172,15 +2376,16 @@ async def agreement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError as exc:
         await query.answer(str(exc), show_alert=True)
         return
-    await query.answer("Accepted ✅" if action == "a" else "Declined ❌")
+    await query.answer(tr(config, "Accepted ✅", "Bisch debii ✅") if action == "a" else tr(config, "Declined ❌", "Abglehnt ❌"))
     text = format_agreement(agreement, config)
     if not was_active and agreement.get("status") == "active":
-        text = "🤝 Agreement is now ACTIVE.\n\n" + text
+        text = tr(config, "🤝 Agreement is now ACTIVE.",
+                  "🤝 Abgmacht isch abgmacht — s'Abkomma gilt jetz!") + "\n\n" + text
         await announce_to_instance(
             context, config, query.message.chat.id if query.message else None, text
         )
     keyboard = (
-        agreement_keyboard(instance_id, agreement_id)
+        agreement_keyboard(config, agreement_id)
         if agreement.get("status") in ("pending", "active")
         else None
     )
@@ -2214,7 +2419,7 @@ async def challenge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer()
         if query.message:
             keyboard = (
-                challenge_keyboard(instance_id, challenge_id)
+                challenge_keyboard(config, challenge_id)
                 if challenge.get("status") == "active"
                 else None
             )
@@ -2225,7 +2430,7 @@ async def challenge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     actor = resolve_participant(query.from_user, config)
     if not actor:
-        await query.answer(PARTICIPANT_GATE_TEXT, show_alert=True)
+        await query.answer(participant_gate(config), show_alert=True)
         return
 
     if action == "e":
@@ -2234,8 +2439,8 @@ async def challenge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except ValueError as exc:
             await query.answer(str(exc), show_alert=True)
             return
-        await query.answer("Challenge ended.")
-        text = "🏁 Challenge ended.\n\n" + format_challenge(challenge, config, today)
+        await query.answer(tr(config, "Challenge ended.", "Usforderig fertig."))
+        text = tr(config, "🏁 Challenge ended.", "🏁 Usforderig fertig.") + "\n\n" + format_challenge(challenge, config, today)
         try:
             await query.edit_message_text(text)
         except Exception:
@@ -2256,16 +2461,18 @@ async def challenge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except ValueError as exc:
             await query.answer(str(exc), show_alert=True)
             return
-        await query.answer(f"+{amount} for {actor.name}")
+        await query.answer(tr(config, "+{n} for {name}", "+{n} für dr {name}. Hopp!", n=amount, name=actor.name))
         text = format_challenge(challenge, config, today)
         keyboard = None
         if completed:
-            text = f"🎉 {actor.name} hit the target — challenge complete!\n\n" + text
+            text = tr(config, "🎉 {name} hit the target — challenge complete!",
+                      "🎉 Dr {name} hät s'Ziil gknackt — Usforderig gschafft!",
+                      name=actor.name) + "\n\n" + text
             await announce_to_instance(
                 context, config, query.message.chat.id if query.message else None, text
             )
         else:
-            keyboard = challenge_keyboard(instance_id, challenge_id)
+            keyboard = challenge_keyboard(config, challenge_id)
         try:
             await query.edit_message_text(text, reply_markup=keyboard)
         except Exception:
@@ -2290,18 +2497,18 @@ async def settle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     actor = user_from_id(user.id, config)
     if not actor:
-        await update.message.reply_text("You're not on the traveler list for this bot.")
+        await update.message.reply_text(traveler_gate(config))
         return
 
     if len(config.users) != 2:
-        await update.message.reply_text("Settlement reset currently needs exactly two subscribed users.")
+        await update.message.reply_text(tr(config, "Settlement reset currently needs exactly two subscribed users.", "Für dr Usglych bruucht's genau zwei aagmäldeti Lüt."))
         return
     other = next((u for u in config.users if u.id != actor.id), None)
 
     # Compute balances before clearing
     net_before = ledger.balances()
     if all(abs(v) < 0.01 for v in net_before.values()):
-        await update.message.reply_text("Balances are already settled.")
+        await update.message.reply_text(tr(config, "Balances are already settled.", "Ihr sind scho quitt."))
         return
 
     diff = net_before.get(actor.id, 0.0)
@@ -2335,9 +2542,14 @@ async def settle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         balances_before=net_before,
     )
     await update.message.reply_text(
-        f"Recorded settlement: {payer.name} paid {receiver.name} {amount_base:.2f} {config.base_currency} "
-        f"('{comment}'). Expenses reset. Balances are now 0 for everyone.",
-        reply_markup=main_menu_keyboard(),
+        tr(config,
+           "Recorded settlement: {payer} paid {receiver} {amount:.2f} {cur} "
+           "('{comment}'). Expenses reset. Balances are now 0 for everyone.",
+           "Usglych verbuacht: {payer} hät em {receiver} {amount:.2f} {cur} zahlt "
+           "(«{comment}»). Alles zrugg uf null.",
+           payer=payer.name, receiver=receiver.name, amount=amount_base,
+           cur=config.base_currency, comment=comment),
+        reply_markup=main_menu_keyboard(config),
     )
 
 
@@ -2369,14 +2581,17 @@ async def finalize_settlement(
         comment=comment,
         balances_before=net_before,
     )
-    reply = (
-        f"Recorded settlement: {actor.name} paid {receiver.name} {amount_base:.2f} {config.base_currency} "
-        f"('{comment}'). Expenses reset. Balances are now 0 for everyone."
-    )
+    reply = tr(config,
+        "Recorded settlement: {payer} paid {receiver} {amount:.2f} {cur} "
+        "('{comment}'). Expenses reset. Balances are now 0 for everyone.",
+        "Usglych verbuacht: {payer} hät em {receiver} {amount:.2f} {cur} zahlt "
+        "(«{comment}»). Alles zrugg uf null.",
+        payer=actor.name, receiver=receiver.name, amount=amount_base,
+        cur=config.base_currency, comment=comment)
     if hasattr(update, "message") and update.message:
-        await update.message.reply_text(reply, reply_markup=main_menu_keyboard())
+        await update.message.reply_text(reply, reply_markup=main_menu_keyboard(config))
     elif hasattr(update, "edit_message_text"):
-        await update.edit_message_text(reply, reply_markup=main_menu_keyboard())
+        await update.edit_message_text(reply, reply_markup=main_menu_keyboard(config))
 
 
 # ------------------------- push-up and menu flows ----------------------- #
@@ -2389,14 +2604,14 @@ async def pushups_command_handler(update: Update, context: ContextTypes.DEFAULT_
         return
     actor = user_from_id(user.id, config)
     if not actor:
-        await update.message.reply_text("You're not on the traveler list for this bot.")
+        await update.message.reply_text(traveler_gate(config))
         return
 
     text = " ".join(context.args) if context.args else (update.message.text or "")
     try:
         count = parse_pushups_text(text)
     except ValueError as exc:
-        await update.message.reply_text(str(exc), reply_markup=pushups_keyboard())
+        await update.message.reply_text(str(exc), reply_markup=pushups_keyboard(config))
         return
 
     record = ledger.log_pushups(actor.id, count)
@@ -2404,9 +2619,11 @@ async def pushups_command_handler(update: Update, context: ContextTypes.DEFAULT_
     totals = ledger.pushups_for_date(day_key)
     standings = format_pushup_standings(totals, config, day_key)
     await update.message.reply_text(
-        f"Logged {count} push-ups for today.\n"
-        f"Total for you today: {record['total_for_day']}.\n\n{standings}",
-        reply_markup=pushups_keyboard(),
+        tr(config, "Logged {count} push-ups for today.\nTotal for you today: {total}.",
+           "{count} Liegestütz ufgschriba.\nDiis Total hüt: {total}.",
+           count=count, total=record["total_for_day"])
+        + f"\n\n{standings}",
+        reply_markup=pushups_keyboard(config),
     )
 
 
@@ -2417,7 +2634,7 @@ async def pushups_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     actor = user_from_id(user.id, config)
     if not actor:
-        await update.message.reply_text("You're not on the traveler list for this bot.")
+        await update.message.reply_text(traveler_gate(config))
         return
     text = update.message.text or ""
     try:
@@ -2425,7 +2642,7 @@ async def pushups_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError as exc:
         await update.message.reply_text(
             f"{exc}\nUse /pushups <count> or the buttons.",
-            reply_markup=pushups_keyboard(),
+            reply_markup=pushups_keyboard(config),
         )
         return
     record = ledger.log_pushups(actor.id, count)
@@ -2433,9 +2650,11 @@ async def pushups_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     totals = ledger.pushups_for_date(day_key)
     standings = format_pushup_standings(totals, config, day_key)
     await update.message.reply_text(
-        f"Logged {count} push-ups for today.\n"
-        f"Total for you today: {record['total_for_day']}.\n\n{standings}",
-        reply_markup=pushups_keyboard(),
+        tr(config, "Logged {count} push-ups for today.\nTotal for you today: {total}.",
+           "{count} Liegestütz ufgschriba.\nDiis Total hüt: {total}.",
+           count=count, total=record["total_for_day"])
+        + f"\n\n{standings}",
+        reply_markup=pushups_keyboard(config),
     )
 
 
@@ -2451,7 +2670,7 @@ async def pushups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     actor = user_from_id(query.from_user.id, config)
     if not actor:
         if query.message:
-            await query.message.reply_text("You're not on the traveler list for this bot.")
+            await query.message.reply_text(traveler_gate(config))
         return
 
     action = data[len(CB_PUSHUPS_PREFIX) :]
@@ -2461,7 +2680,7 @@ async def pushups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             count = int(raw_count)
         except ValueError:
             if query.message:
-                await query.message.reply_text("Invalid push-up amount.", reply_markup=pushups_keyboard())
+                await query.message.reply_text(tr(config, "Invalid push-up amount.", "Das isch kai gültigi Zahl."), reply_markup=pushups_keyboard(config))
             return
         record = ledger.log_pushups(actor.id, count)
         day_key = record["date"]
@@ -2469,16 +2688,19 @@ async def pushups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         standings = format_pushup_standings(totals, config, day_key)
         if query.message:
             await query.message.reply_text(
-                f"Added {count} push-ups for today.\n"
-                f"Your total: {record['total_for_day']}.\n\n{standings}",
-                reply_markup=main_menu_keyboard(),
+                tr(config, "Added {count} push-ups for today.\nYour total: {total}.",
+                   "No {count} Liegestütz dezua.\nDiis Total hüt: {total}.",
+                   count=count, total=record["total_for_day"])
+                + f"\n\n{standings}",
+                reply_markup=main_menu_keyboard(config),
             )
     elif action == "custom":
         context.user_data[user_state_key(config, actor.id, "awaiting_pushups_custom")] = True
         if query.message:
             await query.message.reply_text(
-                "Send the number of push-ups to log for today (e.g. 25).",
-                reply_markup=pushups_keyboard(),
+                tr(config, "Send the number of push-ups to log for today (e.g. 25).",
+                   "Schick d'Zahl vo dina Liegestütz für hüt (z.B. 25)."),
+                reply_markup=pushups_keyboard(config),
             )
 
 
@@ -2490,8 +2712,9 @@ async def settle_via_menu(
     if len(config.users) != 2:
         if query.message:
             await query.message.reply_text(
-                "Settlement reset currently needs exactly two subscribed users.",
-                reply_markup=main_menu_keyboard(),
+                tr(config, "Settlement reset currently needs exactly two subscribed users.",
+                   "Für dr Usglych bruucht's genau zwei aagmäldeti Lüt."),
+                reply_markup=main_menu_keyboard(config),
             )
         return
     other = next((u for u in config.users if u.id != actor.id), None)
@@ -2500,7 +2723,8 @@ async def settle_via_menu(
     if all(abs(v) < 0.01 for v in net_before.values()):
         if query.message:
             await query.message.reply_text(
-                "Balances are already settled.", reply_markup=main_menu_keyboard()
+                tr(config, "Balances are already settled.", "Ihr sind scho quitt."),
+                reply_markup=main_menu_keyboard(config)
             )
         return
 
@@ -2528,9 +2752,14 @@ async def settle_via_menu(
     )
     if query.message:
         await query.message.reply_text(
-            f"Recorded settlement: {payer.name} paid {receiver.name} {amount_base:.2f} {config.base_currency}. "
-            "Balances reset to 0 for everyone.",
-            reply_markup=main_menu_keyboard(),
+            tr(config,
+               "Recorded settlement: {payer} paid {receiver} {amount:.2f} {cur}. "
+               "Balances reset to 0 for everyone.",
+               "Usglych verbuacht: {payer} hät em {receiver} {amount:.2f} {cur} zahlt. "
+               "Alles zrugg uf null.",
+               payer=payer.name, receiver=receiver.name, amount=amount_base,
+               cur=config.base_currency),
+            reply_markup=main_menu_keyboard(config),
         )
 
 
@@ -2541,8 +2770,9 @@ async def send_pushups_prompt(
     totals = ledger.pushups_for_date(today_key)
     standings = format_pushup_standings(totals, config, today_key)
     await messageable.reply_text(
-        f"{standings}\n\nUse the buttons to add push-ups for today.",
-        reply_markup=pushups_keyboard(),
+        standings + "\n\n" + tr(config, "Use the buttons to add push-ups for today.",
+                                  "Mit da Chnöpf chasch dini Liegestütz für hüt dezua tua."),
+        reply_markup=pushups_keyboard(config),
     )
 
 
@@ -2552,7 +2782,7 @@ async def send_pushups_standings(
     target_day = day_key or datetime.now(timezone.utc).date().isoformat()
     totals = ledger.pushups_for_date(target_day)
     standings = format_pushup_standings(totals, config, target_day)
-    await messageable.reply_text(standings, reply_markup=main_menu_keyboard())
+    await messageable.reply_text(standings, reply_markup=main_menu_keyboard(config))
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2583,30 +2813,31 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     actor = user_from_id(query.from_user.id, config)
     if not actor:
         if query.message:
-            await query.message.reply_text("You're not on the traveler list for this bot.")
+            await query.message.reply_text(traveler_gate(config))
         return
 
     if action == "add_expense":
         if query.message:
             await query.message.reply_text(
-                "Send: <amount> [CUR] <description> to log an expense.",
-                reply_markup=main_menu_keyboard(),
+                tr(config, "Send: <amount> [CUR] <description> to log an expense.",
+                   "Schick: <Betrag> [CUR] <Beschriibig> zum a Usgab iitraga."),
+                reply_markup=main_menu_keyboard(config),
             )
     elif action == "balance":
         net = ledger.balances()
-        text = format_balance_lines(net, config.users, config.base_currency)
+        text = format_balance_lines(net, config)
         if query.message:
-            await query.message.reply_text(text, reply_markup=main_menu_keyboard())
+            await query.message.reply_text(text, reply_markup=main_menu_keyboard(config))
     elif action == "history":
         entries = ledger.last_entries(limit=10)
         if query.message:
             if not entries:
-                await query.message.reply_text("No expenses yet.", reply_markup=main_menu_keyboard())
+                await query.message.reply_text(tr(config, "No expenses yet.", "No kai Usgaba da."), reply_markup=main_menu_keyboard(config))
             else:
-                lines = [format_entry_line(exp, config.base_currency) for exp in entries]
+                lines = [format_entry_line(exp, config) for exp in entries]
                 await query.message.reply_text(
-                    "Recent activity:\n" + "\n".join(lines),
-                    reply_markup=main_menu_keyboard(),
+                    tr(config, "Recent activity:", "Di letschta Iiträg:") + "\n" + "\n".join(lines),
+                    reply_markup=main_menu_keyboard(config),
                 )
     elif action == "settle":
         await settle_via_menu(update, context, actor)
@@ -2619,16 +2850,18 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     elif action in {"help", "home"}:
         if query.message:
             await query.message.reply_text(
-                "Menu ready. Pick an action:",
-                reply_markup=main_menu_keyboard(),
+                tr(config, "Menu ready. Pick an action:", "S'Menü isch parat. Was söll's sii?"),
+                reply_markup=main_menu_keyboard(config),
             )
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "Menu:", reply_markup=main_menu_keyboard()
-        )
+    if not update.message:
+        return
+    _, config = get_runtime_for_update(update, context)
+    await update.message.reply_text(
+        tr(config, "Menu:", "S'Menü, bittschön:"), reply_markup=main_menu_keyboard(config)
+    )
 
 
 async def agreement_checkin_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2656,7 +2889,9 @@ async def agreement_checkin_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         for agreement in ledger.finish_due_agreements(today):
             await send_to_all(
-                "🏁 Agreement period complete!\n\n"
+                tr(config, "🏁 Agreement period complete!",
+                   "🏁 D'Zyt isch um — s'Abkomma isch duregzoga!")
+                + "\n\n"
                 + format_agreement(agreement, config, today)
             )
         for agreement in ledger.state.get("agreements", []):
@@ -2666,9 +2901,10 @@ async def agreement_checkin_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if not checkin or not is_scheduled_day(checkin.get("days", "daily"), today):
                 continue
             await send_to_all(
-                f"Did you hold it today?\n\n"
+                tr(config, "Did you hold it today?", "Und, häsch es hüt gschafft?")
+                + "\n\n"
                 + format_checkin_day(agreement, config, day_iso, today),
-                keyboard=checkin_keyboard(instance_id, str(agreement["id"]), day_iso),
+                keyboard=checkin_keyboard(config, str(agreement["id"]), day_iso),
             )
 
 
@@ -2687,7 +2923,7 @@ async def challenge_deadline_sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = instance.get("chat_id")
         recipients = [chat_id] if chat_id else [u.id for u in config.users]
         for challenge in ended:
-            text = "⏰ Deadline reached.\n\n" + format_challenge(challenge, config, today)
+            text = tr(config, "⏰ Deadline reached.", "⏰ D'Zyt isch um.") + "\n\n" + format_challenge(challenge, config, today)
             for recipient in recipients:
                 try:
                     await context.bot.send_message(chat_id=recipient, text=text)
@@ -2772,6 +3008,8 @@ def build_application(config: BotConfig, store: InstanceStore) -> Application:
     application.add_handler(CommandHandler("instance", instance_handler))
     application.add_handler(CommandHandler("instances", instances_handler))
     application.add_handler(CommandHandler("use", use_instance_handler))
+    application.add_handler(CommandHandler("dialekt", dialekt_handler))
+    application.add_handler(CommandHandler("dialect", dialekt_handler))
     application.add_handler(CommandHandler("agree", agree_handler))
     application.add_handler(CommandHandler("accept", accept_handler))
     application.add_handler(CommandHandler("decline", decline_handler))
