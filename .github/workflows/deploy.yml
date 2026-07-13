@@ -1,0 +1,43 @@
+name: Deploy travel bot
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: travel-bot-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install deploy tools
+        run: sudo apt-get update && sudo apt-get install -y rsync
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.NASNAS_DEPLOY_HOST }}
+          DEPLOY_KEY: ${{ secrets.NASNAS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_KEY"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > "${RUNNER_TEMP}/nasnas_deploy"
+          chmod 600 "${RUNNER_TEMP}/nasnas_deploy"
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy and restart service
+        env:
+          NASNAS_SERVER: ${{ secrets.NASNAS_DEPLOY_USER }}@${{ secrets.NASNAS_DEPLOY_HOST }}
+          NASNAS_SSH_KEY: ${{ runner.temp }}/nasnas_deploy
+          NASNAS_REMOTE_SUDO: sudo
+        run: ./deploy.sh deploy

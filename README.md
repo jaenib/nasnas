@@ -39,7 +39,14 @@ Lightweight Telegram bot for shared expenses, agreements, and challenges. The or
 - `/pushups <count>` — built-in daily push-up challenge log.
 - Plain text like `12.40 coffee` also logs an expense.
 
-Note: This repo currently tracks small maintenance tweaks; feel free to remove this line after merging the YOLO test PR.
+## Deployment
+- Pushes to `main` deploy automatically through GitHub Actions (`.github/workflows/deploy.yml`).
+- The workflow uses these repository secrets: `NASNAS_DEPLOY_HOST`, `NASNAS_DEPLOY_USER`, and `NASNAS_DEPLOY_KEY`.
+- Manual fallback from a trusted machine:
+  ```bash
+  ./deploy.sh deploy
+  ```
+- Server-only files are preserved during deploy: `.env` and `data/`.
 
 ## Systemd service (server)
 1) Copy the repo to your server (e.g. `/usr/bots/travel-bot`) and create a `.env` there.  

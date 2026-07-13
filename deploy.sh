@@ -5,7 +5,7 @@
 #
 # SERVER
 #   Host    : 82.165.45.100
-#   User    : root, SSH key only
+#   User    : deploy for automation, root for emergency admin
 #   Bot dir : /usr/bots/travel-bot
 #   Service : travel-bot
 #   Venv    : /usr/bots/travel-bot/.venv
@@ -21,9 +21,31 @@
 
 set -euo pipefail
 
-SERVER="root@82.165.45.100"
-BOT_DIR="/usr/bots/travel-bot"
-SERVICE="travel-bot"
+SERVER="${NASNAS_SERVER:-root@82.165.45.100}"
+BOT_DIR="${NASNAS_BOT_DIR:-/usr/bots/travel-bot}"
+SERVICE="${NASNAS_SERVICE:-travel-bot}"
+REMOTE_SUDO="${NASNAS_REMOTE_SUDO:-}"
+SSH_ARGS=()
+if [[ -n "${NASNAS_SSH_KEY:-}" ]]; then
+  SSH_ARGS+=("-i" "$NASNAS_SSH_KEY" "-o" "IdentitiesOnly=yes")
+fi
+SSH_ARGS+=("-o" "StrictHostKeyChecking=yes")
+
+ssh_run() {
+  ssh "${SSH_ARGS[@]}" "$@"
+}
+
+rsync_ssh() {
+  local args=()
+  local arg
+  for arg in "${SSH_ARGS[@]}"; do
+    args+=("$arg")
+  done
+  printf 'ssh'
+  for arg in "${args[@]}"; do
+    printf ' %q' "$arg"
+  done
+}
 
 redact_bot_tokens() {
   sed -E 's#bot[0-9]+:[A-Za-z0-9_-]+#bot<redacted>#g'
@@ -41,45 +63,46 @@ case "${1:-help}" in
       --exclude "deploy/*credentials*.txt" \
       --exclude "deploy/ssh_*.sh" \
       --exclude "travel-bot.service" \
+      -e "$(rsync_ssh)" \
       ./ "$SERVER:$BOT_DIR/"
-    ssh "$SERVER" "
+    ssh_run "$SERVER" "
       set -euo pipefail
       cd '$BOT_DIR'
       python3 -m venv .venv
       .venv/bin/pip install -r requirements.txt
-      systemctl restart '$SERVICE'
-      systemctl is-active '$SERVICE'
+      $REMOTE_SUDO systemctl restart '$SERVICE'
+      $REMOTE_SUDO systemctl is-active '$SERVICE'
     "
     ;;
 
   status)
-    ssh "$SERVER" "
-      systemctl is-active '$SERVICE'
-      systemctl show '$SERVICE' --property=MainPID,ExecMainStatus,FragmentPath --no-pager
+    ssh_run "$SERVER" "
+      $REMOTE_SUDO systemctl is-active '$SERVICE'
+      $REMOTE_SUDO systemctl show '$SERVICE' --property=MainPID,ExecMainStatus,FragmentPath --no-pager
     "
     ;;
 
   logs)
-    ssh "$SERVER" "journalctl -u '$SERVICE' -n 80 --no-pager" | redact_bot_tokens
+    ssh_run "$SERVER" "$REMOTE_SUDO journalctl -u '$SERVICE' -n 80 --no-pager" | redact_bot_tokens
     ;;
 
   follow)
-    ssh "$SERVER" "journalctl -u '$SERVICE' -f" | redact_bot_tokens
+    ssh_run "$SERVER" "$REMOTE_SUDO journalctl -u '$SERVICE' -f" | redact_bot_tokens
     ;;
 
   restart)
-    ssh "$SERVER" "systemctl restart '$SERVICE' && systemctl is-active '$SERVICE'"
+    ssh_run "$SERVER" "$REMOTE_SUDO systemctl restart '$SERVICE' && $REMOTE_SUDO systemctl is-active '$SERVICE'"
     ;;
 
   data)
-    scp "$SERVER:$BOT_DIR/data/expenses.json" /tmp/nasnas-expenses-live.json
+    scp "${SSH_ARGS[@]}" "$SERVER:$BOT_DIR/data/expenses.json" /tmp/nasnas-expenses-live.json
     echo "Saved to /tmp/nasnas-expenses-live.json"
     ;;
 
   push-data)
     local_file="${2:?usage: deploy.sh push-data <expenses.json>}"
-    scp "$local_file" "$SERVER:$BOT_DIR/data/expenses.json"
-    ssh "$SERVER" "systemctl restart '$SERVICE' && systemctl is-active '$SERVICE'"
+    scp "${SSH_ARGS[@]}" "$local_file" "$SERVER:$BOT_DIR/data/expenses.json"
+    ssh_run "$SERVER" "$REMOTE_SUDO systemctl restart '$SERVICE' && $REMOTE_SUDO systemctl is-active '$SERVICE'"
     ;;
 
   help|*)
