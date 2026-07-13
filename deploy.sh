@@ -53,7 +53,7 @@ redact_bot_tokens() {
 
 case "${1:-help}" in
   deploy)
-    rsync -az --delete --omit-dir-times \
+    rsync -az --delete --omit-dir-times --no-perms --no-owner --no-group \
       --exclude ".git/" \
       --exclude ".DS_Store" \
       --exclude "__pycache__/" \
